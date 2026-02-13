@@ -347,7 +347,10 @@ func processContent(ctx context.Context, fi *os.File, o *flags.SyncOpts, s *stor
 						return err
 					}
 				}
-				s.CopyAll(ctx, s.OCI, nil)
+				// Reload index after cosign operations
+				if err := s.OCI.LoadIndex(); err != nil {
+					return err
+				}
 
 			case "v1":
 				var cfg v1.Images
@@ -487,7 +490,10 @@ func processContent(ctx context.Context, fi *os.File, o *flags.SyncOpts, s *stor
 						return err
 					}
 				}
-				s.CopyAll(ctx, s.OCI, nil)
+				// Reload index after cosign operations
+				if err := s.OCI.LoadIndex(); err != nil {
+					return err
+				}
 
 			default:
 				return fmt.Errorf("unsupported version [%s] for kind [%s]... valid versions are [v1 and v1alpha1]", gvk.Version, gvk.Kind)
