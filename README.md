@@ -65,6 +65,5 @@ brew install hauler
 
 `Hauler` wouldn't be possible without the open-source community, but there are a few projects that stand out:
 
-- [oras cli](https://github.com/oras-project/oras)
 - [cosign](https://github.com/sigstore/cosign)
 - [go-containerregistry](https://github.com/google/go-containerregistry)
