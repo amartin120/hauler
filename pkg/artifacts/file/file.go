@@ -2,6 +2,7 @@ package file
 
 import (
 	"context"
+	"fmt"
 
 	gv1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/google/go-containerregistry/pkg/v1/partial"
@@ -100,7 +101,7 @@ func (f *File) compute() error {
 
 	cfg := f.client.Config(f.Path)
 	if cfg == nil {
-		cfg = f.client.Config(f.Path)
+		return fmt.Errorf("unsupported file type or protocol for: %s", f.Path)
 	}
 
 	cfgDesc, err := partial.Descriptor(cfg)
