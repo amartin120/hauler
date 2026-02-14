@@ -93,7 +93,7 @@ func (s *pusher) Push(ctx context.Context, desc ocispec.Descriptor) (ccontent.Wr
 	// Double-check the final path is within destDir (defense in depth)
 	// Use filepath.Rel to ensure the relative path doesn't escape
 	relPath, err := filepath.Rel(destDir, fullFileName)
-	if err != nil || strings.HasPrefix(relPath, ".."+string(filepath.Separator)) {
+	if err != nil || strings.HasPrefix(relPath, ".."+string(filepath.Separator)) || relPath == ".." {
 		return nil, fmt.Errorf("path would escape destination directory: %s", filename)
 	}
 

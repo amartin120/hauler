@@ -51,7 +51,10 @@ func (w *IoContentWriter) Write(p []byte) (n int, err error) {
 	return n, err
 }
 
-// Close closes the writer and verifies the digest if configured
+// Close closes the writer and verifies the digest if configured.
+// Note: This assumes all data has been written via Write() before Close() is called.
+// The digest is computed incrementally during Write() calls, not during Close().
+// Validation happens before closing to catch digest mismatches before resources are released.
 func (w *IoContentWriter) Close() error {
 	if w.outputHash != "" {
 		computed := w.digester.Digest().String()

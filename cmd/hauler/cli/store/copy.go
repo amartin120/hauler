@@ -48,12 +48,19 @@ func CopyCmd(ctx context.Context, o *flags.CopyOpts, s *store.Layout, targetRef 
 					l.Warnf("failed to fetch index [%s]: %v", reference, err)
 					return nil
 				}
-				defer rc.Close()
 
 				var index ocispec.Index
 				if err := json.NewDecoder(rc).Decode(&index); err != nil {
+					if cerr := rc.Close(); cerr != nil {
+						l.Warnf("failed to close index reader for [%s]: %v", reference, cerr)
+					}
 					l.Warnf("failed to decode index for [%s]: %v", reference, err)
 					return nil
+				}
+
+				// Close rc immediately after decoding - we're done reading from it
+				if cerr := rc.Close(); cerr != nil {
+					l.Warnf("failed to close index reader for [%s]: %v", reference, cerr)
 				}
 
 				// Process each manifest in the index
