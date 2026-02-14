@@ -315,6 +315,9 @@ func (l *Layout) CopyAll(ctx context.Context, to content.Target, toMapper func(s
 		// The reference parameter from Walk is the nameMap key with format "ref-kind",
 		// but we need the clean ref for the destination to avoid double-appending kind
 		baseRef := desc.Annotations[ocispec.AnnotationRefName]
+		if baseRef == "" {
+			return fmt.Errorf("descriptor %s missing required annotation %q", reference, ocispec.AnnotationRefName)
+		}
 		toRef := baseRef
 		if toMapper != nil {
 			tr, err := toMapper(baseRef)
