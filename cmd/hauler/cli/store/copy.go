@@ -48,10 +48,10 @@ func CopyCmd(ctx context.Context, o *flags.CopyOpts, s *store.Layout, targetRef 
 					l.Warnf("failed to fetch index [%s]: %v", reference, err)
 					return nil
 				}
-				defer rc.Close()
 
 				var index ocispec.Index
 				if err := json.NewDecoder(rc).Decode(&index); err != nil {
+					rc.Close()
 					l.Warnf("failed to decode index for [%s]: %v", reference, err)
 					return nil
 				}
@@ -95,6 +95,7 @@ func CopyCmd(ctx context.Context, o *flags.CopyOpts, s *store.Layout, targetRef 
 
 					l.Debugf("extracted child manifest from index [%s]", reference)
 				}
+				rc.Close()
 
 			case ocispec.MediaTypeImageManifest, consts.DockerManifestSchema2:
 				// Single-platform manifest
@@ -103,10 +104,10 @@ func CopyCmd(ctx context.Context, o *flags.CopyOpts, s *store.Layout, targetRef 
 					l.Warnf("failed to fetch [%s]: %v", reference, err)
 					return nil
 				}
-				defer rc.Close()
 
 				var m ocispec.Manifest
 				if err := json.NewDecoder(rc).Decode(&m); err != nil {
+					rc.Close()
 					l.Warnf("failed to decode manifest for [%s]: %v", reference, err)
 					return nil
 				}
@@ -114,6 +115,7 @@ func CopyCmd(ctx context.Context, o *flags.CopyOpts, s *store.Layout, targetRef 
 				// Skip images - only extract files and charts for directory targets
 				if m.Config.MediaType == consts.DockerConfigJSON ||
 					m.Config.MediaType == consts.OCIManifestSchema1 {
+					rc.Close()
 					l.Debugf("skipping image [%s] for directory target", reference)
 					return nil
 				}
@@ -121,6 +123,7 @@ func CopyCmd(ctx context.Context, o *flags.CopyOpts, s *store.Layout, targetRef 
 				// Create a mapper store based on the manifest type
 				mapperStore, err := mapper.FromManifest(m, components[1])
 				if err != nil {
+					rc.Close()
 					l.Warnf("failed to create mapper for [%s]: %v", reference, err)
 					return nil
 				}
@@ -128,9 +131,11 @@ func CopyCmd(ctx context.Context, o *flags.CopyOpts, s *store.Layout, targetRef 
 				// Copy/extract the content
 				_, err = s.Copy(ctx, reference, mapperStore, "")
 				if err != nil {
+					rc.Close()
 					l.Warnf("failed to extract [%s]: %v", reference, err)
 					return nil
 				}
+				rc.Close()
 
 				l.Debugf("extracted [%s] to directory", reference)
 

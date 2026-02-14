@@ -34,10 +34,11 @@ func ResolveName(desc ocispec.Descriptor) (string, bool) {
 
 // IoContentWriter wraps an io.Writer to implement containerd's content.Writer
 type IoContentWriter struct {
-	writer     io.WriteCloser
-	digester   digest.Digester
-	status     ccontent.Status
-	outputHash string
+	writer       io.WriteCloser
+	digester     digest.Digester
+	status       ccontent.Status
+	outputHash   string
+	bytesWritten int64
 }
 
 // Write writes data to the underlying writer and updates the digest
@@ -45,6 +46,7 @@ func (w *IoContentWriter) Write(p []byte) (n int, err error) {
 	n, err = w.writer.Write(p)
 	if n > 0 {
 		w.digester.Hash().Write(p[:n])
+		w.bytesWritten += int64(n)
 	}
 	return n, err
 }
@@ -65,8 +67,21 @@ func (w *IoContentWriter) Digest() digest.Digest {
 	return w.digester.Digest()
 }
 
-// Commit is a no-op for this implementation
+// Commit validates the digest and size, then finalizes the write
 func (w *IoContentWriter) Commit(ctx context.Context, size int64, expected digest.Digest, opts ...ccontent.Opt) error {
+	// Validate size matches bytes written
+	if size > 0 && size != w.bytesWritten {
+		return fmt.Errorf("size mismatch: expected %d bytes, wrote %d bytes", size, w.bytesWritten)
+	}
+
+	// Validate digest matches computed digest
+	if expected != "" {
+		computed := w.digester.Digest()
+		if computed != expected {
+			return fmt.Errorf("digest mismatch: expected %s, got %s", expected, computed)
+		}
+	}
+
 	return nil
 }
 
@@ -104,3 +119,16 @@ func NewIoContentWriter(writer io.WriteCloser, opts ...writerOption) *IoContentW
 
 // AnnotationUnpack is the annotation key for unpacking
 const AnnotationUnpack = "io.containerd.image.unpack"
+
+// nopCloser wraps an io.Writer to implement io.WriteCloser with a no-op Close
+type nopCloser struct {
+	io.Writer
+}
+
+func (nopCloser) Close() error { return nil }
+
+// NopWriteCloser returns an io.WriteCloser with a no-op Close method wrapping
+// the provided io.Writer.
+func NopWriteCloser(w io.Writer) io.WriteCloser {
+	return nopCloser{w}
+}

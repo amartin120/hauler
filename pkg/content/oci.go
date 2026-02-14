@@ -311,7 +311,7 @@ func (p *ociPusher) Push(ctx context.Context, d ocispec.Descriptor) (ccontent.Wr
 
 	if _, err := os.Stat(blobPath); err == nil {
 		// file already exists, discard (but validate digest)
-		return NewIoContentWriter(nopCloser{io.Discard}, WithOutputHash(d.Digest.String())), nil
+		return NewIoContentWriter(NopWriteCloser(io.Discard), WithOutputHash(d.Digest.String())), nil
 	}
 
 	f, err := os.Create(blobPath)
@@ -334,10 +334,3 @@ func (o *OCI) ResolvePath(elem string) string {
 	}
 	return filepath.Join(o.root, elem)
 }
-
-// nopCloser wraps an io.Writer to implement io.WriteCloser
-type nopCloser struct {
-	io.Writer
-}
-
-func (nopCloser) Close() error { return nil }

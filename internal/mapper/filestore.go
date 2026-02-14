@@ -56,14 +56,14 @@ func (s *pusher) Push(ctx context.Context, desc ocispec.Descriptor) (ccontent.Wr
 	// They're metadata and don't need to be extracted
 	if _, ok := content.ResolveName(desc); ok {
 		// Discard manifests/indexes, they're just metadata
-		return content.NewIoContentWriter(&nopCloser{io.Discard}, content.WithOutputHash(desc.Digest.String())), nil
+		return content.NewIoContentWriter(content.NopWriteCloser(io.Discard), content.WithOutputHash(desc.Digest.String())), nil
 	}
 
 	// Check if this descriptor has a mapper for its media type
 	mapperFn, hasMapper := s.mapper[desc.MediaType]
 	if !hasMapper {
 		// No mapper for this media type, discard it (config blobs, etc.)
-		return content.NewIoContentWriter(&nopCloser{io.Discard}, content.WithOutputHash(desc.Digest.String())), nil
+		return content.NewIoContentWriter(content.NopWriteCloser(io.Discard), content.WithOutputHash(desc.Digest.String())), nil
 	}
 
 	// Get the filename from the mapper function
@@ -112,12 +112,6 @@ func (s *pusher) Push(ctx context.Context, desc ocispec.Descriptor) (ccontent.Wr
 	w := content.NewIoContentWriter(f, content.WithOutputHash(desc.Digest.String()))
 	return w, nil
 }
-
-type nopCloser struct {
-	io.Writer
-}
-
-func (*nopCloser) Close() error { return nil }
 
 type pusher struct {
 	store  *content.OCI
