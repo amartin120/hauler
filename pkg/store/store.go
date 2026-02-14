@@ -208,8 +208,9 @@ func (l *Layout) copyDescriptorGraph(ctx context.Context, desc ocispec.Descripto
 		if err != nil {
 			return fmt.Errorf("failed to fetch manifest: %w", err)
 		}
+		defer rc.Close()
+
 		data, err := io.ReadAll(rc)
-		rc.Close()
 		if err != nil {
 			return fmt.Errorf("failed to read manifest: %w", err)
 		}
@@ -242,8 +243,9 @@ func (l *Layout) copyDescriptorGraph(ctx context.Context, desc ocispec.Descripto
 		if err != nil {
 			return fmt.Errorf("failed to fetch index: %w", err)
 		}
+		defer rc.Close()
+
 		data, err := io.ReadAll(rc)
-		rc.Close()
 		if err != nil {
 			return fmt.Errorf("failed to read index: %w", err)
 		}
@@ -276,7 +278,7 @@ func (l *Layout) copyDescriptorGraph(ctx context.Context, desc ocispec.Descripto
 }
 
 // copyDescriptor copies a single descriptor from source to target
-func (l *Layout) copyDescriptor(ctx context.Context, desc ocispec.Descriptor, fetcher remotes.Fetcher, pusher remotes.Pusher) error {
+func (l *Layout) copyDescriptor(ctx context.Context, desc ocispec.Descriptor, fetcher remotes.Fetcher, pusher remotes.Pusher) (err error) {
 	// Fetch the content
 	rc, err := fetcher.Fetch(ctx, desc)
 	if err != nil {
@@ -289,7 +291,11 @@ func (l *Layout) copyDescriptor(ctx context.Context, desc ocispec.Descriptor, fe
 	if err != nil {
 		return err
 	}
-	defer writer.Close()
+	defer func() {
+		if closeErr := writer.Close(); closeErr != nil && err == nil {
+			err = closeErr
+		}
+	}()
 
 	// Copy the content
 	n, err := io.Copy(writer, rc)
@@ -298,7 +304,6 @@ func (l *Layout) copyDescriptor(ctx context.Context, desc ocispec.Descriptor, fe
 	}
 
 	// Commit the written content with the expected digest
-	// Note: Close is called automatically via defer
 	return writer.Commit(ctx, n, desc.Digest)
 }
 
@@ -306,9 +311,13 @@ func (l *Layout) copyDescriptor(ctx context.Context, desc ocispec.Descriptor, fe
 func (l *Layout) CopyAll(ctx context.Context, to content.Target, toMapper func(string) (string, error)) ([]ocispec.Descriptor, error) {
 	var descs []ocispec.Descriptor
 	err := l.OCI.Walk(func(reference string, desc ocispec.Descriptor) error {
-		toRef := reference // Default to source reference for proper index updates
+		// Use the clean reference from annotations (without -kind suffix) as the base
+		// The reference parameter from Walk is the nameMap key with format "ref-kind",
+		// but we need the clean ref for the destination to avoid double-appending kind
+		baseRef := desc.Annotations[ocispec.AnnotationRefName]
+		toRef := baseRef
 		if toMapper != nil {
-			tr, err := toMapper(reference)
+			tr, err := toMapper(baseRef)
 			if err != nil {
 				return err
 			}
