@@ -48,10 +48,10 @@ func CopyCmd(ctx context.Context, o *flags.CopyOpts, s *store.Layout, targetRef 
 					l.Warnf("failed to fetch index [%s]: %v", reference, err)
 					return nil
 				}
+				defer rc.Close()
 
 				var index ocispec.Index
 				if err := json.NewDecoder(rc).Decode(&index); err != nil {
-					rc.Close()
 					l.Warnf("failed to decode index for [%s]: %v", reference, err)
 					return nil
 				}
@@ -95,7 +95,6 @@ func CopyCmd(ctx context.Context, o *flags.CopyOpts, s *store.Layout, targetRef 
 
 					l.Debugf("extracted child manifest from index [%s]", reference)
 				}
-				rc.Close()
 
 			case ocispec.MediaTypeImageManifest, consts.DockerManifestSchema2:
 				// Single-platform manifest
