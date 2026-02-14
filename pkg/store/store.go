@@ -190,53 +190,89 @@ func (l *Layout) Copy(ctx context.Context, ref string, to content.Target, toRef 
 		return ocispec.Descriptor{}, fmt.Errorf("failed to get pusher: %w", err)
 	}
 
-	// Fetch the manifest
-	rc, err := fetcher.Fetch(ctx, desc)
-	if err != nil {
-		return ocispec.Descriptor{}, fmt.Errorf("failed to fetch manifest: %w", err)
-	}
-	defer rc.Close()
-
-	data, err := io.ReadAll(rc)
-	if err != nil {
-		return ocispec.Descriptor{}, fmt.Errorf("failed to read manifest: %w", err)
-	}
-
-	// Handle different media types
-	switch desc.MediaType {
-	case ocispec.MediaTypeImageManifest, consts.DockerManifestSchema2:
-		var manifest ocispec.Manifest
-		if err := json.Unmarshal(data, &manifest); err != nil {
-			return ocispec.Descriptor{}, fmt.Errorf("failed to unmarshal manifest: %w", err)
-		}
-
-		// Copy config
-		if err := l.copyDescriptor(ctx, manifest.Config, fetcher, pusher); err != nil {
-			return ocispec.Descriptor{}, fmt.Errorf("failed to copy config: %w", err)
-		}
-
-		// Copy layers
-		for _, layer := range manifest.Layers {
-			if err := l.copyDescriptor(ctx, layer, fetcher, pusher); err != nil {
-				return ocispec.Descriptor{}, fmt.Errorf("failed to copy layer: %w", err)
-			}
-		}
-
-	case ocispec.MediaTypeImageIndex, consts.DockerManifestListSchema2:
-		var index ocispec.Index
-		if err := json.Unmarshal(data, &index); err != nil {
-			return ocispec.Descriptor{}, fmt.Errorf("failed to unmarshal index: %w", err)
-		}
-
-		// Copy each manifest in the index
-		for _, manifest := range index.Manifests {
-			if err := l.copyDescriptor(ctx, manifest, fetcher, pusher); err != nil {
-				return ocispec.Descriptor{}, fmt.Errorf("failed to copy manifest: %w", err)
-			}
-		}
+	// Recursively copy the descriptor graph (matches oras.Copy behavior)
+	if err := l.copyDescriptorGraph(ctx, desc, fetcher, pusher); err != nil {
+		return ocispec.Descriptor{}, err
 	}
 
 	return desc, nil
+}
+
+// copyDescriptorGraph recursively copies a descriptor and all its referenced content
+// This matches the behavior of oras.Copy by walking the entire descriptor graph
+func (l *Layout) copyDescriptorGraph(ctx context.Context, desc ocispec.Descriptor, fetcher remotes.Fetcher, pusher remotes.Pusher) error {
+	switch desc.MediaType {
+	case ocispec.MediaTypeImageManifest, consts.DockerManifestSchema2:
+		// Fetch and parse the manifest
+		rc, err := fetcher.Fetch(ctx, desc)
+		if err != nil {
+			return fmt.Errorf("failed to fetch manifest: %w", err)
+		}
+		data, err := io.ReadAll(rc)
+		rc.Close()
+		if err != nil {
+			return fmt.Errorf("failed to read manifest: %w", err)
+		}
+
+		var manifest ocispec.Manifest
+		if err := json.Unmarshal(data, &manifest); err != nil {
+			return fmt.Errorf("failed to unmarshal manifest: %w", err)
+		}
+
+		// Copy config blob
+		if err := l.copyDescriptor(ctx, manifest.Config, fetcher, pusher); err != nil {
+			return fmt.Errorf("failed to copy config: %w", err)
+		}
+
+		// Copy all layer blobs
+		for _, layer := range manifest.Layers {
+			if err := l.copyDescriptor(ctx, layer, fetcher, pusher); err != nil {
+				return fmt.Errorf("failed to copy layer: %w", err)
+			}
+		}
+
+		// Copy the manifest itself
+		if err := l.copyDescriptor(ctx, desc, fetcher, pusher); err != nil {
+			return fmt.Errorf("failed to copy manifest: %w", err)
+		}
+
+	case ocispec.MediaTypeImageIndex, consts.DockerManifestListSchema2:
+		// Fetch and parse the index
+		rc, err := fetcher.Fetch(ctx, desc)
+		if err != nil {
+			return fmt.Errorf("failed to fetch index: %w", err)
+		}
+		data, err := io.ReadAll(rc)
+		rc.Close()
+		if err != nil {
+			return fmt.Errorf("failed to read index: %w", err)
+		}
+
+		var index ocispec.Index
+		if err := json.Unmarshal(data, &index); err != nil {
+			return fmt.Errorf("failed to unmarshal index: %w", err)
+		}
+
+		// Recursively copy each child (could be manifest or nested index)
+		for _, child := range index.Manifests {
+			if err := l.copyDescriptorGraph(ctx, child, fetcher, pusher); err != nil {
+				return fmt.Errorf("failed to copy child: %w", err)
+			}
+		}
+
+		// Copy the index itself
+		if err := l.copyDescriptor(ctx, desc, fetcher, pusher); err != nil {
+			return fmt.Errorf("failed to copy index: %w", err)
+		}
+
+	default:
+		// For other types (config blobs, layers, etc.), just copy the blob
+		if err := l.copyDescriptor(ctx, desc, fetcher, pusher); err != nil {
+			return fmt.Errorf("failed to copy descriptor: %w", err)
+		}
+	}
+
+	return nil
 }
 
 // copyDescriptor copies a single descriptor from source to target
@@ -256,24 +292,33 @@ func (l *Layout) copyDescriptor(ctx context.Context, desc ocispec.Descriptor, fe
 	defer writer.Close()
 
 	// Copy the content
-	if _, err := io.Copy(writer, rc); err != nil {
+	n, err := io.Copy(writer, rc)
+	if err != nil {
 		return err
 	}
 
-	return writer.Close()
+	// Commit the written content with the expected digest
+	// Note: Close is called automatically via defer
+	return writer.Commit(ctx, n, desc.Digest)
 }
 
 // CopyAll performs bulk copy operations on the stores oci layout to a provided target
 func (l *Layout) CopyAll(ctx context.Context, to content.Target, toMapper func(string) (string, error)) ([]ocispec.Descriptor, error) {
 	var descs []ocispec.Descriptor
 	err := l.OCI.Walk(func(reference string, desc ocispec.Descriptor) error {
-		toRef := ""
+		toRef := reference // Default to source reference for proper index updates
 		if toMapper != nil {
 			tr, err := toMapper(reference)
 			if err != nil {
 				return err
 			}
 			toRef = tr
+		}
+
+		// Append the digest to help the target pusher identify the root descriptor
+		// Format: "reference@digest" allows the pusher to update its index.json
+		if desc.Digest.Validate() == nil {
+			toRef = fmt.Sprintf("%s@%s", toRef, desc.Digest)
 		}
 
 		desc, err := l.Copy(ctx, reference, to, toRef)

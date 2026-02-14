@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 
+	"github.com/containerd/containerd/remotes"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 
 	"hauler.dev/go/hauler/internal/flags"
@@ -37,43 +39,105 @@ func CopyCmd(ctx context.Context, o *flags.CopyOpts, s *store.Layout, targetRef 
 
 		// For directory targets, extract files and charts (not images)
 		err := s.Walk(func(reference string, desc ocispec.Descriptor) error {
-			// Fetch the descriptor
-			rc, err := s.Fetch(ctx, desc)
-			if err != nil {
-				l.Warnf("failed to fetch [%s]: %v", reference, err)
-				return nil // Continue with other items
-			}
-			defer rc.Close()
+			// Handle different media types
+			switch desc.MediaType {
+			case ocispec.MediaTypeImageIndex, consts.DockerManifestListSchema2:
+				// Multi-platform index - process each child manifest
+				rc, err := s.Fetch(ctx, desc)
+				if err != nil {
+					l.Warnf("failed to fetch index [%s]: %v", reference, err)
+					return nil
+				}
+				defer rc.Close()
 
-			// Decode the manifest
-			var m ocispec.Manifest
-			if err := json.NewDecoder(rc).Decode(&m); err != nil {
-				l.Warnf("failed to decode manifest for [%s]: %v", reference, err)
-				return nil // Continue with other items
+				var index ocispec.Index
+				if err := json.NewDecoder(rc).Decode(&index); err != nil {
+					l.Warnf("failed to decode index for [%s]: %v", reference, err)
+					return nil
+				}
+
+				// Process each manifest in the index
+				for _, manifestDesc := range index.Manifests {
+					manifestRC, err := s.Fetch(ctx, manifestDesc)
+					if err != nil {
+						l.Warnf("failed to fetch child manifest: %v", err)
+						continue
+					}
+
+					var m ocispec.Manifest
+					if err := json.NewDecoder(manifestRC).Decode(&m); err != nil {
+						manifestRC.Close()
+						l.Warnf("failed to decode child manifest: %v", err)
+						continue
+					}
+					manifestRC.Close()
+
+					// Skip images - only extract files and charts
+					if m.Config.MediaType == consts.DockerConfigJSON ||
+						m.Config.MediaType == consts.OCIManifestSchema1 {
+						l.Debugf("skipping image manifest in index [%s]", reference)
+						continue
+					}
+
+					// Create mapper and extract
+					mapperStore, err := mapper.FromManifest(m, components[1])
+					if err != nil {
+						l.Warnf("failed to create mapper for child: %v", err)
+						continue
+					}
+
+					// Note: We can't call s.Copy with manifestDesc because it's not in the nameMap
+					// Instead, we need to manually push through the mapper
+					if err := extractManifestContent(ctx, s, manifestDesc, m, mapperStore); err != nil {
+						l.Warnf("failed to extract child: %v", err)
+						continue
+					}
+
+					l.Debugf("extracted child manifest from index [%s]", reference)
+				}
+
+			case ocispec.MediaTypeImageManifest, consts.DockerManifestSchema2:
+				// Single-platform manifest
+				rc, err := s.Fetch(ctx, desc)
+				if err != nil {
+					l.Warnf("failed to fetch [%s]: %v", reference, err)
+					return nil
+				}
+				defer rc.Close()
+
+				var m ocispec.Manifest
+				if err := json.NewDecoder(rc).Decode(&m); err != nil {
+					l.Warnf("failed to decode manifest for [%s]: %v", reference, err)
+					return nil
+				}
+
+				// Skip images - only extract files and charts for directory targets
+				if m.Config.MediaType == consts.DockerConfigJSON ||
+					m.Config.MediaType == consts.OCIManifestSchema1 {
+					l.Debugf("skipping image [%s] for directory target", reference)
+					return nil
+				}
+
+				// Create a mapper store based on the manifest type
+				mapperStore, err := mapper.FromManifest(m, components[1])
+				if err != nil {
+					l.Warnf("failed to create mapper for [%s]: %v", reference, err)
+					return nil
+				}
+
+				// Copy/extract the content
+				_, err = s.Copy(ctx, reference, mapperStore, "")
+				if err != nil {
+					l.Warnf("failed to extract [%s]: %v", reference, err)
+					return nil
+				}
+
+				l.Debugf("extracted [%s] to directory", reference)
+
+			default:
+				l.Debugf("skipping unsupported media type [%s] for [%s]", desc.MediaType, reference)
 			}
 
-			// Skip images - only extract files and charts for directory targets
-			if m.Config.MediaType == consts.DockerConfigJSON ||
-				m.Config.MediaType == consts.OCIManifestSchema1 {
-				l.Debugf("skipping image [%s] for directory target", reference)
-				return nil
-			}
-
-			// Create a mapper store based on the manifest type
-			mapperStore, err := mapper.FromManifest(m, components[1])
-			if err != nil {
-				l.Warnf("failed to create mapper for [%s]: %v", reference, err)
-				return nil // Continue with other items
-			}
-
-			// Copy/extract the content
-			_, err = s.Copy(ctx, reference, mapperStore, "")
-			if err != nil {
-				l.Warnf("failed to extract [%s]: %v", reference, err)
-				return nil // Continue with other items
-			}
-
-			l.Debugf("extracted [%s] to directory", reference)
 			return nil
 		})
 		if err != nil {
@@ -97,5 +161,64 @@ func CopyCmd(ctx context.Context, o *flags.CopyOpts, s *store.Layout, targetRef 
 	}
 
 	l.Infof("copied artifacts to [%s]", components[1])
+	return nil
+}
+
+// extractManifestContent extracts a manifest's layers through a mapper target
+// This is used for child manifests in indexes that aren't in the store's nameMap
+func extractManifestContent(ctx context.Context, s *store.Layout, desc ocispec.Descriptor, m ocispec.Manifest, target content.Target) error {
+	// Get a pusher from the target
+	pusher, err := target.Pusher(ctx, "")
+	if err != nil {
+		return fmt.Errorf("failed to get pusher: %w", err)
+	}
+
+	// Copy config blob
+	if err := copyBlobDescriptor(ctx, s, m.Config, pusher); err != nil {
+		return fmt.Errorf("failed to copy config: %w", err)
+	}
+
+	// Copy each layer blob
+	for _, layer := range m.Layers {
+		if err := copyBlobDescriptor(ctx, s, layer, pusher); err != nil {
+			return fmt.Errorf("failed to copy layer: %w", err)
+		}
+	}
+
+	// Copy the manifest itself
+	if err := copyBlobDescriptor(ctx, s, desc, pusher); err != nil {
+		return fmt.Errorf("failed to copy manifest: %w", err)
+	}
+
+	return nil
+}
+
+// copyBlobDescriptor copies a single descriptor blob from the store to a pusher
+func copyBlobDescriptor(ctx context.Context, s *store.Layout, desc ocispec.Descriptor, pusher remotes.Pusher) error {
+	// Fetch the content from the store
+	rc, err := s.OCI.Fetch(ctx, desc)
+	if err != nil {
+		return fmt.Errorf("failed to fetch blob: %w", err)
+	}
+	defer rc.Close()
+
+	// Get a writer from the pusher
+	writer, err := pusher.Push(ctx, desc)
+	if err != nil {
+		return fmt.Errorf("failed to push: %w", err)
+	}
+	defer writer.Close()
+
+	// Copy the content
+	n, err := io.Copy(writer, rc)
+	if err != nil {
+		return fmt.Errorf("failed to copy content: %w", err)
+	}
+
+	// Commit the written content
+	if err := writer.Commit(ctx, n, desc.Digest); err != nil {
+		return fmt.Errorf("failed to commit: %w", err)
+	}
+
 	return nil
 }

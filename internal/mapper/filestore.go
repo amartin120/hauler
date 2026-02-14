@@ -72,9 +72,36 @@ func (s *pusher) Push(ctx context.Context, desc ocispec.Descriptor) (ccontent.Wr
 		return nil, err
 	}
 
+	// Sanitize the filename to prevent path traversal attacks
+	// Reject absolute paths
+	if filepath.IsAbs(filename) {
+		return nil, fmt.Errorf("absolute paths not allowed: %s", filename)
+	}
+
+	// Clean the path to remove .., ./, and other relative path elements
+	filename = filepath.Clean(filename)
+
+	// Reject paths that still try to escape (e.g., "../../../etc/passwd" becomes "../../etc/passwd" after clean)
+	if strings.HasPrefix(filename, ".."+string(filepath.Separator)) || filename == ".." {
+		return nil, fmt.Errorf("path traversal not allowed: %s", filename)
+	}
+
 	// Get the destination directory and create the full path
 	destDir := s.store.ResolvePath("")
 	fullFileName := filepath.Join(destDir, filename)
+
+	// Double-check the final path is within destDir (defense in depth)
+	// Use filepath.Rel to ensure the relative path doesn't escape
+	relPath, err := filepath.Rel(destDir, fullFileName)
+	if err != nil || strings.HasPrefix(relPath, ".."+string(filepath.Separator)) {
+		return nil, fmt.Errorf("path would escape destination directory: %s", filename)
+	}
+
+	// Create parent directories if the filename includes subdirectories
+	parentDir := filepath.Dir(fullFileName)
+	if err := os.MkdirAll(parentDir, 0755); err != nil {
+		return nil, errors.Wrap(err, fmt.Sprintf("creating parent directory for %s", fullFileName))
+	}
 
 	// Create the file
 	f, err := os.OpenFile(fullFileName, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
@@ -82,7 +109,7 @@ func (s *pusher) Push(ctx context.Context, desc ocispec.Descriptor) (ccontent.Wr
 		return nil, errors.Wrap(err, fmt.Sprintf("creating file %s", fullFileName))
 	}
 
-	w := content.NewIoContentWriter(f, content.WithInputHash(desc.Digest.String()), content.WithOutputHash(desc.Digest.String()))
+	w := content.NewIoContentWriter(f, content.WithOutputHash(desc.Digest.String()))
 	return w, nil
 }
 
