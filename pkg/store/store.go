@@ -1,6 +1,7 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -200,7 +201,7 @@ func (l *Layout) Copy(ctx context.Context, ref string, to content.Target, toRef 
 
 // copyDescriptorGraph recursively copies a descriptor and all its referenced content
 // This matches the behavior of oras.Copy by walking the entire descriptor graph
-func (l *Layout) copyDescriptorGraph(ctx context.Context, desc ocispec.Descriptor, fetcher remotes.Fetcher, pusher remotes.Pusher) error {
+func (l *Layout) copyDescriptorGraph(ctx context.Context, desc ocispec.Descriptor, fetcher remotes.Fetcher, pusher remotes.Pusher) (err error) {
 	switch desc.MediaType {
 	case ocispec.MediaTypeImageManifest, consts.DockerManifestSchema2:
 		// Fetch and parse the manifest
@@ -333,14 +334,14 @@ func (l *Layout) pushData(ctx context.Context, desc ocispec.Descriptor, data []b
 		}
 	}()
 
-	// Write the data
-	n, err := writer.Write(data)
+	// Write the data using io.Copy to handle short writes properly
+	n, err := io.Copy(writer, bytes.NewReader(data))
 	if err != nil {
 		return fmt.Errorf("failed to write data: %w", err)
 	}
 
 	// Commit the written content with the expected digest
-	return writer.Commit(ctx, int64(n), desc.Digest)
+	return writer.Commit(ctx, n, desc.Digest)
 }
 
 // CopyAll performs bulk copy operations on the stores oci layout to a provided target
