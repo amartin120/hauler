@@ -145,15 +145,15 @@ func (o *OCI) SaveIndex() error {
 	return os.WriteFile(o.path(ocispec.ImageIndexFile), data, 0644)
 }
 
-// Resolve attempts to resolve the reference into a name and descriptor.
+// Resolve attempts to resolve the reference into a descriptor.
 //
 // The argument `ref` should be a scheme-less URI representing the remote.
 // Structurally, it has a host and path. The "host" can be used to directly
 // reference a specific host or be matched against a specific handler.
 //
-// The returned name should be used to identify the referenced entity.
-// Dependending on the remote namespace, this may be immutable or mutable.
-// While the name may differ from ref, it should itself be a valid ref.
+// The returned descriptor contains the content digest, size, media type,
+// and annotations for the referenced entity. The ref must match a key in
+// the OCI nameMap (typically in format "reference-kind").
 //
 // If the resolution fails, an error will be returned.
 func (o *OCI) Resolve(ctx context.Context, ref string) (ocispec.Descriptor, error) {

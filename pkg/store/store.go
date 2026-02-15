@@ -169,7 +169,7 @@ func (l *Layout) Flush(ctx context.Context) error {
 	return nil
 }
 
-// Copy will copy a given reference to a given target.Target
+// Copy will copy a given reference to a given content.Target
 //
 //	This is essentially a replacement for oras.Copy, custom implementation for content stores
 func (l *Layout) Copy(ctx context.Context, ref string, to content.Target, toRef string) (ocispec.Descriptor, error) {
