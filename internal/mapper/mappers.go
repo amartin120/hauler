@@ -11,7 +11,11 @@ import (
 
 type Fn func(desc ocispec.Descriptor) (string, error)
 
-// FromManifest will return the appropriate content store given a reference and source type adequate for storing the results on disk
+// FromManifest returns the appropriate content store given a manifest and root directory.
+// The returned store is stateless and doesn't hold persistent resources (file handles, locks, etc.).
+// No cleanup or Close() is required - the Go garbage collector will reclaim memory when the store
+// is no longer referenced. All file operations performed by the store are transient and complete
+// within individual method calls.
 func FromManifest(manifest ocispec.Manifest, root string) (content.Target, error) {
 	// First, switch on config mediatype to identify known types
 	switch manifest.Config.MediaType {
