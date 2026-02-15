@@ -208,7 +208,11 @@ func (l *Layout) copyDescriptorGraph(ctx context.Context, desc ocispec.Descripto
 		if err != nil {
 			return fmt.Errorf("failed to fetch manifest: %w", err)
 		}
-		defer rc.Close()
+		defer func() {
+			if closeErr := rc.Close(); closeErr != nil && err == nil {
+				err = fmt.Errorf("failed to close manifest reader: %w", closeErr)
+			}
+		}()
 
 		data, err := io.ReadAll(rc)
 		if err != nil {
@@ -232,9 +236,9 @@ func (l *Layout) copyDescriptorGraph(ctx context.Context, desc ocispec.Descripto
 			}
 		}
 
-		// Copy the manifest itself
-		if err := l.copyDescriptor(ctx, desc, fetcher, pusher); err != nil {
-			return fmt.Errorf("failed to copy manifest: %w", err)
+		// Push the manifest itself using the already-fetched data to avoid double-fetching
+		if err := l.pushData(ctx, desc, data, pusher); err != nil {
+			return fmt.Errorf("failed to push manifest: %w", err)
 		}
 
 	case ocispec.MediaTypeImageIndex, consts.DockerManifestListSchema2:
@@ -243,7 +247,11 @@ func (l *Layout) copyDescriptorGraph(ctx context.Context, desc ocispec.Descripto
 		if err != nil {
 			return fmt.Errorf("failed to fetch index: %w", err)
 		}
-		defer rc.Close()
+		defer func() {
+			if closeErr := rc.Close(); closeErr != nil && err == nil {
+				err = fmt.Errorf("failed to close index reader: %w", closeErr)
+			}
+		}()
 
 		data, err := io.ReadAll(rc)
 		if err != nil {
@@ -262,9 +270,9 @@ func (l *Layout) copyDescriptorGraph(ctx context.Context, desc ocispec.Descripto
 			}
 		}
 
-		// Copy the index itself
-		if err := l.copyDescriptor(ctx, desc, fetcher, pusher); err != nil {
-			return fmt.Errorf("failed to copy index: %w", err)
+		// Push the index itself using the already-fetched data to avoid double-fetching
+		if err := l.pushData(ctx, desc, data, pusher); err != nil {
+			return fmt.Errorf("failed to push index: %w", err)
 		}
 
 	default:
@@ -284,7 +292,11 @@ func (l *Layout) copyDescriptor(ctx context.Context, desc ocispec.Descriptor, fe
 	if err != nil {
 		return err
 	}
-	defer rc.Close()
+	defer func() {
+		if closeErr := rc.Close(); closeErr != nil && err == nil {
+			err = fmt.Errorf("failed to close reader: %w", closeErr)
+		}
+	}()
 
 	// Get a writer from the pusher
 	writer, err := pusher.Push(ctx, desc)
@@ -305,6 +317,30 @@ func (l *Layout) copyDescriptor(ctx context.Context, desc ocispec.Descriptor, fe
 
 	// Commit the written content with the expected digest
 	return writer.Commit(ctx, n, desc.Digest)
+}
+
+// pushData pushes already-fetched data to the pusher without re-fetching.
+// This is used when we've already read the data for parsing and want to avoid double-fetching.
+func (l *Layout) pushData(ctx context.Context, desc ocispec.Descriptor, data []byte, pusher remotes.Pusher) (err error) {
+	// Get a writer from the pusher
+	writer, err := pusher.Push(ctx, desc)
+	if err != nil {
+		return fmt.Errorf("failed to get writer: %w", err)
+	}
+	defer func() {
+		if closeErr := writer.Close(); closeErr != nil && err == nil {
+			err = fmt.Errorf("failed to close writer: %w", closeErr)
+		}
+	}()
+
+	// Write the data
+	n, err := writer.Write(data)
+	if err != nil {
+		return fmt.Errorf("failed to write data: %w", err)
+	}
+
+	// Commit the written content with the expected digest
+	return writer.Commit(ctx, int64(n), desc.Digest)
 }
 
 // CopyAll performs bulk copy operations on the stores oci layout to a provided target
@@ -422,7 +458,7 @@ func (l *Layout) CleanUp(ctx context.Context) (int, int64, error) {
 	}
 
 	var processManifest func(desc ocispec.Descriptor) error
-	processManifest = func(desc ocispec.Descriptor) error {
+	processManifest = func(desc ocispec.Descriptor) (err error) {
 		if desc.Digest.Validate() != nil {
 			return nil
 		}
@@ -435,7 +471,11 @@ func (l *Layout) CleanUp(ctx context.Context) (int, int64, error) {
 		if err != nil {
 			return nil // skip if can't be read
 		}
-		defer rc.Close()
+		defer func() {
+			if closeErr := rc.Close(); closeErr != nil && err == nil {
+				err = closeErr
+			}
+		}()
 
 		var manifest struct {
 			Config struct {
