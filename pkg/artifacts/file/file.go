@@ -92,8 +92,11 @@ func (f *File) compute() error {
 		return err
 	}
 
-	// Manually preserve the Title annotation from the layer
-	// The layer was created with this annotation in getter.LayerFrom
+	// Explicitly set the Title annotation on the layer descriptor.
+	// While the layer is created with this annotation in getter.LayerFrom,
+	// we set it here defensively to ensure it's always present on the descriptor
+	// returned by partial.Descriptor, as mutation of descriptor fields is safer
+	// than relying on all annotation paths through partial.Descriptor.
 	if layer.Annotations == nil {
 		layer.Annotations = make(map[string]string)
 	}
