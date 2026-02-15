@@ -70,7 +70,14 @@ func (w *IoContentWriter) Digest() digest.Digest {
 	return w.digester.Digest()
 }
 
-// Commit validates the digest and size, then finalizes the write
+// Commit validates the digest and size before the write is finalized.
+// This method does NOT close the underlying writer - Close() must still be called
+// (typically via defer) after Commit succeeds to properly finalize and release resources.
+// The typical usage pattern is:
+//
+//	defer writer.Close()
+//	// ... write data ...
+//	return writer.Commit(ctx, size, digest)
 func (w *IoContentWriter) Commit(ctx context.Context, size int64, expected digest.Digest, opts ...ccontent.Opt) error {
 	// Validate size matches bytes written
 	if size > 0 && size != w.bytesWritten {

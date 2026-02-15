@@ -218,7 +218,11 @@ func copyBlobDescriptor(ctx context.Context, s *store.Layout, desc ocispec.Descr
 	if err != nil {
 		return fmt.Errorf("failed to push: %w", err)
 	}
-	defer writer.Close()
+	defer func() {
+		if closeErr := writer.Close(); closeErr != nil && err == nil {
+			err = fmt.Errorf("failed to close writer: %w", closeErr)
+		}
+	}()
 
 	// Copy the content
 	n, err := io.Copy(writer, rc)
