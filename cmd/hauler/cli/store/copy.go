@@ -205,7 +205,7 @@ func extractManifestContent(ctx context.Context, s *store.Layout, desc ocispec.D
 }
 
 // copyBlobDescriptor copies a single descriptor blob from the store to a pusher
-func copyBlobDescriptor(ctx context.Context, s *store.Layout, desc ocispec.Descriptor, pusher remotes.Pusher) error {
+func copyBlobDescriptor(ctx context.Context, s *store.Layout, desc ocispec.Descriptor, pusher remotes.Pusher) (err error) {
 	// Fetch the content from the store
 	rc, err := s.OCI.Fetch(ctx, desc)
 	if err != nil {
