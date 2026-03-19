@@ -133,6 +133,7 @@ func storeImage(ctx context.Context, s *store.Layout, i v1.Image, platform strin
 	}
 
 	if rewrite != "" {
+		rawRewrite := rewrite // save before any mutations, to detect explicit docker.io intent
 		rewrite = strings.TrimPrefix(rewrite, "/")
 		if !strings.Contains(rewrite, ":") {
 			if tag, ok := r.(name.Tag); ok {
@@ -146,7 +147,7 @@ func storeImage(ctx context.Context, s *store.Layout, i v1.Image, platform strin
 		if err != nil {
 			return fmt.Errorf("unable to parse rewrite name [%s]: %w", rewrite, err)
 		}
-		if err := rewriteReference(ctx, s, r, newRef); err != nil {
+		if err := rewriteReference(ctx, s, r, newRef, rawRewrite); err != nil {
 			return err
 		}
 	}
@@ -155,7 +156,7 @@ func storeImage(ctx context.Context, s *store.Layout, i v1.Image, platform strin
 	return nil
 }
 
-func rewriteReference(ctx context.Context, s *store.Layout, oldRef name.Reference, newRef name.Reference) error {
+func rewriteReference(ctx context.Context, s *store.Layout, oldRef name.Reference, newRef name.Reference, rawRewrite string) error {
 	l := log.FromContext(ctx)
 
 	if err := s.OCI.LoadIndex(); err != nil {
@@ -183,8 +184,11 @@ func rewriteReference(ctx context.Context, s *store.Layout, oldRef name.Referenc
 	oldRegistry := oldRefContext.RegistryStr()
 	newRegistry := newRefContext.RegistryStr()
 	// If user omitted a registry in the rewrite string, go-containerregistry defaults to
-	// index.docker.io. Preserve the original registry when the source is non-docker.
-	if newRegistry == "index.docker.io" && oldRegistry != "index.docker.io" {
+	// index.docker.io. Preserve the original registry only when the source is non-docker
+	// AND the user did not explicitly specify a docker.io-family hostname.
+	// We inspect rawRewrite (the string before ParseReference normalises it) to
+	// distinguish "user wrote docker.io/..." from "user omitted a registry entirely".
+	if newRegistry == "index.docker.io" && oldRegistry != "index.docker.io" && !hasExplicitDockerHubRegistry(rawRewrite) {
 		newRegistry = oldRegistry
 	}
 	oldTotal := oldRepo + ":" + oldTag
@@ -213,6 +217,22 @@ func rewriteReference(ctx context.Context, s *store.Layout, oldRef name.Referenc
 
 	return s.OCI.SaveIndex()
 
+}
+
+// hasExplicitDockerHubRegistry reports whether the raw rewrite string begins with
+// a docker.io-family hostname. go-containerregistry normalises all of these to
+// "index.docker.io" during ParseReference, so we must inspect the raw string to
+// tell "user omitted registry" from "user explicitly targeted docker.io".
+func hasExplicitDockerHubRegistry(raw string) bool {
+	raw = strings.TrimPrefix(raw, "/")
+	host := strings.SplitN(raw, "/", 2)[0]
+	// strip any tag or digest from a bare host (shouldn't occur, but be safe)
+	host = strings.SplitN(host, ":", 2)[0]
+	switch host {
+	case "docker.io", "index.docker.io", "registry-1.docker.io":
+		return true
+	}
+	return false
 }
 
 func AddChartCmd(ctx context.Context, o *flags.AddChartOpts, s *store.Layout, chartName string, rso *flags.StoreRootOpts, ro *flags.CliRootOpts) error {
