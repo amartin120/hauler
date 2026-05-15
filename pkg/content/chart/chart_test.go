@@ -7,7 +7,7 @@ import (
 
 	v1 "github.com/google/go-containerregistry/pkg/v1"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
-	"helm.sh/helm/v3/pkg/action"
+	"helm.sh/helm/v4/pkg/action"
 
 	"hauler.dev/go/hauler/pkg/consts"
 	"hauler.dev/go/hauler/pkg/content/chart"
@@ -73,7 +73,10 @@ func TestNewChart(t *testing.T) {
 					Hex:       "016e68d9f7083d2c4fd302f951ee6490dbf4cb1ef44cfc06914c39cbfb01d858",
 				},
 				Annotations: map[string]string{
-					ocispec.AnnotationTitle: "cert-manager-v1.15.3.tgz",
+					// helm v4 stores downloaded charts by content digest in its cache
+					// (e.g. <sha256hex>.chart), so the title annotation reflects the
+					// cache file name, not the original chart archive name.
+					ocispec.AnnotationTitle: "016e68d9f7083d2c4fd302f951ee6490dbf4cb1ef44cfc06914c39cbfb01d858.chart",
 				},
 			},
 			wantErr: false,

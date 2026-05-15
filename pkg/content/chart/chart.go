@@ -4,10 +4,13 @@ import (
 	"archive/tar"
 	"bytes"
 	"compress/gzip"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"fmt"
 	"io"
 	"io/fs"
+	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -17,12 +20,11 @@ import (
 	gtypes "github.com/google/go-containerregistry/pkg/v1/types"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"hauler.dev/go/hauler/pkg/artifacts"
-	"hauler.dev/go/hauler/pkg/log"
-	"helm.sh/helm/v3/pkg/action"
-	"helm.sh/helm/v3/pkg/chart"
-	"helm.sh/helm/v3/pkg/chart/loader"
-	"helm.sh/helm/v3/pkg/cli"
-	"helm.sh/helm/v3/pkg/registry"
+	"helm.sh/helm/v4/pkg/action"
+	chart "helm.sh/helm/v4/pkg/chart/v2"
+	"helm.sh/helm/v4/pkg/chart/v2/loader"
+	"helm.sh/helm/v4/pkg/cli"
+	"helm.sh/helm/v4/pkg/registry"
 
 	"hauler.dev/go/hauler/pkg/consts"
 	"hauler.dev/go/hauler/pkg/layer"
@@ -43,7 +45,7 @@ type Chart struct {
 func NewChart(name string, opts *action.ChartPathOptions) (*Chart, error) {
 	chartRef := name
 	actionConfig := new(action.Configuration)
-	if err := actionConfig.Init(settings.RESTClientGetter(), settings.Namespace(), os.Getenv("HELM_DRIVER"), log.NewLogger(os.Stdout).Debugf); err != nil {
+	if err := actionConfig.Init(settings.RESTClientGetter(), settings.Namespace(), os.Getenv("HELM_DRIVER")); err != nil {
 		return nil, err
 	}
 
@@ -51,7 +53,7 @@ func NewChart(name string, opts *action.ChartPathOptions) (*Chart, error) {
 	client.ChartPathOptions.Version = opts.Version
 
 	registryClient, err := newRegistryClient(client.CertFile, client.KeyFile, client.CaFile,
-		client.InsecureSkipTLSverify, client.PlainHTTP)
+		client.InsecureSkipTLSVerify, client.PlainHTTP)
 	if err != nil {
 		return nil, fmt.Errorf("missing registry client: %w", err)
 	}
@@ -288,18 +290,66 @@ func newDefaultRegistryClient(plainHTTP bool) (*registry.Client, error) {
 }
 
 func newRegistryClientWithTLS(certFile, keyFile, caFile string, insecureSkipTLSverify bool) (*registry.Client, error) {
-	// create a new registry client
-	registryClient, err := registry.NewRegistryClientWithTLS(
-		io.Discard,
-		certFile, keyFile, caFile,
-		insecureSkipTLSverify,
-		settings.RegistryConfig,
-		settings.Debug,
+	tlsConf, err := newTLSConfig(certFile, keyFile, caFile, insecureSkipTLSverify)
+	if err != nil {
+		return nil, fmt.Errorf("can't create TLS config for registry client: %w", err)
+	}
+
+	registryClient, err := registry.NewClient(
+		registry.ClientOptDebug(settings.Debug),
+		registry.ClientOptEnableCache(true),
+		registry.ClientOptWriter(io.Discard),
+		registry.ClientOptCredentialsFile(settings.RegistryConfig),
+		registry.ClientOptHTTPClient(&http.Client{
+			Transport: &http.Transport{
+				TLSClientConfig: tlsConf,
+				Proxy:           http.ProxyFromEnvironment,
+			},
+		}),
 	)
 	if err != nil {
 		return nil, err
 	}
 	return registryClient, nil
+}
+
+// newTLSConfig builds a tls.Config from the provided cert/key/CA files and
+// insecure-skip-verify flag, mirroring the logic previously provided by the
+// now-removed registry.NewRegistryClientWithTLS helper in helm v4.
+func newTLSConfig(certFile, keyFile, caFile string, insecureSkipVerify bool) (*tls.Config, error) {
+	conf := &tls.Config{
+		InsecureSkipVerify: insecureSkipVerify, //nolint:gosec
+	}
+
+	if certFile != "" && keyFile != "" {
+		certPEM, err := os.ReadFile(certFile)
+		if err != nil {
+			return nil, fmt.Errorf("unable to read cert file %q: %w", certFile, err)
+		}
+		keyPEM, err := os.ReadFile(keyFile)
+		if err != nil {
+			return nil, fmt.Errorf("unable to read key file %q: %w", keyFile, err)
+		}
+		cert, err := tls.X509KeyPair(certPEM, keyPEM)
+		if err != nil {
+			return nil, fmt.Errorf("unable to load cert/key pair: %w", err)
+		}
+		conf.Certificates = []tls.Certificate{cert}
+	}
+
+	if caFile != "" {
+		caPEM, err := os.ReadFile(caFile)
+		if err != nil {
+			return nil, fmt.Errorf("unable to read CA file %q: %w", caFile, err)
+		}
+		cp := x509.NewCertPool()
+		if !cp.AppendCertsFromPEM(caPEM) {
+			return nil, fmt.Errorf("failed to append certificates from %q", caFile)
+		}
+		conf.RootCAs = cp
+	}
+
+	return conf, nil
 }
 
 // path returns the local filesystem path to the chart archive or directory
