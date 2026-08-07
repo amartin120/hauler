@@ -10,8 +10,6 @@ import (
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
 
-	content2 "hauler.dev/go/hauler/v2/pkg/artifacts"
-	"hauler.dev/go/hauler/v2/pkg/consts"
 	"hauler.dev/go/hauler/v2/pkg/content"
 	"hauler.dev/go/hauler/v2/pkg/layer"
 )
@@ -39,7 +37,13 @@ type Getter interface {
 
 	Name(*url.URL) string
 
-	Config(*url.URL) content2.Config
+	// MediaType reports the OCI media type for the content at u, used as the
+	// layer's real mediaType instead of a hauler-private constant.
+	MediaType(*url.URL) string
+
+	// Annotations reports manifest-level provenance annotations for the
+	// content at u (e.g. org.opencontainers.image.url/.created).
+	Annotations(*url.URL) map[string]string
 }
 
 func NewClient(opts ClientOptions) *Client {
@@ -82,8 +86,12 @@ func (c *Client) LayerFrom(ctx context.Context, source string) (v1.Layer, error)
 		annotations[content.AnnotationUnpack] = "true"
 	}
 
+	// Call g.MediaType directly rather than round-tripping through
+	// c.MediaType(source): g and u are already resolved above, so going
+	// through the Client would just re-parse the URL and re-run getter
+	// detection for no benefit.
 	l, err := layer.FromOpener(opener,
-		layer.WithMediaType(consts.FileLayerMediaType),
+		layer.WithMediaType(g.MediaType(u)),
 		layer.WithAnnotations(annotations))
 	if err != nil {
 		return nil, err
@@ -131,20 +139,31 @@ func (c *Client) Name(source string) string {
 	return source
 }
 
-func (c *Client) Config(source string) content2.Config {
+// MediaType resolves source's getter and returns its detected OCI media type.
+func (c *Client) MediaType(source string) string {
+	u, err := url.Parse(source)
+	if err != nil {
+		return ""
+	}
+	for _, g := range c.Getters {
+		if g.Detect(u) {
+			return g.MediaType(u)
+		}
+	}
+	return ""
+}
+
+// Annotations resolves source's getter and returns its manifest-level
+// provenance annotations.
+func (c *Client) Annotations(source string) map[string]string {
 	u, err := url.Parse(source)
 	if err != nil {
 		return nil
 	}
 	for _, g := range c.Getters {
 		if g.Detect(u) {
-			return g.Config(u)
+			return g.Annotations(u)
 		}
 	}
 	return nil
-}
-
-type config struct {
-	Reference   string            `json:"reference"`
-	Annotations map[string]string `json:"annotations,omitempty"`
 }

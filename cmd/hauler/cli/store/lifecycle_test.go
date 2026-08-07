@@ -14,7 +14,11 @@ import (
 	"testing"
 
 	"github.com/google/go-containerregistry/pkg/name"
+	"github.com/google/go-containerregistry/pkg/v1/empty"
+	"github.com/google/go-containerregistry/pkg/v1/mutate"
 	"github.com/google/go-containerregistry/pkg/v1/remote"
+	"github.com/google/go-containerregistry/pkg/v1/static"
+	gvtypes "github.com/google/go-containerregistry/pkg/v1/types"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 
 	"hauler.dev/go/hauler/v2/internal/flags"
@@ -178,6 +182,64 @@ func TestLifecycle_FileArtifact_OldFormatStore_AddSaveLoadCopy(t *testing.T) {
 	}
 	if string(data) != fileContent {
 		t.Errorf("file content mismatch: got %q, want %q", string(data), fileContent)
+	}
+}
+
+// TestLifecycle_FileArtifact_LegacyManifestShape_CopyDir proves a file
+// artifact manifest written in the pre-content-derived-identity shape --
+// config.MediaType = FileLocalConfigMediaType, layer.MediaType =
+// FileLayerMediaType -- still round-trips through store copy dir:// after
+// the OCI-native empty-config shape became the write path. Mirrors
+// extract_test.go's TestExtractCmd_OciArtifactKindImage, but exercises
+// CopyCmd's dir:// path instead of ExtractCmd.
+func TestLifecycle_FileArtifact_LegacyManifestShape_CopyDir(t *testing.T) {
+	ctx := newTestContext(t)
+
+	// newLocalhostRegistry is required: s.AddImage uses authn.DefaultKeychain
+	// and go-containerregistry auto-selects plain HTTP only for "localhost:" hosts.
+	host, rOpts := newLocalhostRegistry(t)
+
+	fileContent := []byte("legacy-shaped file artifact content")
+	fileLayer := static.NewLayer(fileContent, gvtypes.MediaType(consts.FileLayerMediaType))
+	img, err := mutate.Append(empty.Image, mutate.Addendum{
+		Layer: fileLayer,
+		Annotations: map[string]string{
+			ocispec.AnnotationTitle: "legacy-shaped-file.txt",
+		},
+	})
+	if err != nil {
+		t.Fatalf("mutate.Append: %v", err)
+	}
+	img = mutate.MediaType(img, gvtypes.OCIManifestSchema1)
+	img = mutate.ConfigMediaType(img, gvtypes.MediaType(consts.FileLocalConfigMediaType))
+
+	ref := host + "/legacy-artifacts/myfile:v1"
+	tag, err := name.NewTag(ref, name.Insecure)
+	if err != nil {
+		t.Fatalf("name.NewTag: %v", err)
+	}
+	if err := remote.Write(tag, img, rOpts...); err != nil {
+		t.Fatalf("remote.Write: %v", err)
+	}
+
+	s := newTestStore(t)
+	if _, err := s.AddImage(ctx, ref, "", false, "", rOpts...); err != nil {
+		t.Fatalf("AddImage: %v", err)
+	}
+
+	extractDir := t.TempDir()
+	copyOpts := &flags.CopyOpts{StoreRootOpts: defaultRootOpts(s.Root)}
+	if err := CopyCmd(ctx, copyOpts, s, "dir://"+extractDir, defaultCliOpts()); err != nil {
+		t.Fatalf("CopyCmd dir: %v", err)
+	}
+
+	outPath := filepath.Join(extractDir, "legacy-shaped-file.txt")
+	data, err := os.ReadFile(outPath)
+	if err != nil {
+		t.Fatalf("expected extracted file at %s: %v", outPath, err)
+	}
+	if string(data) != string(fileContent) {
+		t.Errorf("content mismatch: got %q, want %q", string(data), string(fileContent))
 	}
 }
 

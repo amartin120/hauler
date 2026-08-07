@@ -3,12 +3,13 @@ package getter
 import (
 	"context"
 	"io"
+	"mime"
 	"net/url"
 	"os"
 	"path/filepath"
+	"time"
 
-	"hauler.dev/go/hauler/v2/pkg/artifacts"
-	"hauler.dev/go/hauler/v2/pkg/consts"
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 )
 
 type File struct{}
@@ -41,13 +42,33 @@ func (f File) path(u *url.URL) string {
 	return filepath.Join(u.Host, u.Path)
 }
 
-func (f File) Config(u *url.URL) artifacts.Config {
-	c := &fileConfig{
-		config{Reference: u.String()},
+// MediaType detects the OCI media type from the file's extension via Go's
+// builtin mime table, falling back to application/octet-stream for an
+// unrecognized or missing extension. mime.TypeByExtension can return a
+// "; charset=..." parameter, which the manifest's bare mediaType field must
+// not carry, so the result is always re-parsed through mime.ParseMediaType.
+func (f File) MediaType(u *url.URL) string {
+	mt := mime.TypeByExtension(filepath.Ext(f.path(u)))
+	if mt == "" {
+		return "application/octet-stream"
 	}
-	return artifacts.ToConfig(c, artifacts.WithConfigMediaType(consts.FileLocalConfigMediaType))
+	t, _, err := mime.ParseMediaType(mt)
+	if err != nil || t == "" {
+		return "application/octet-stream"
+	}
+	return t
 }
 
-type fileConfig struct {
-	config `json:",inline,omitempty"`
+// Annotations returns manifest-level provenance annotations for a local file
+// source: the source path always, plus the file's own mtime when os.Stat
+// succeeds -- an on-disk mtime is a real, already-available timestamp, unlike
+// an HTTP source where the only meaningful time is when hauler fetched it.
+func (f File) Annotations(u *url.URL) map[string]string {
+	ann := map[string]string{
+		ocispec.AnnotationURL: u.String(),
+	}
+	if fi, err := os.Stat(f.path(u)); err == nil {
+		ann[ocispec.AnnotationCreated] = fi.ModTime().UTC().Format(time.RFC3339)
+	}
+	return ann
 }

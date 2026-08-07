@@ -2,6 +2,7 @@ package file
 
 import (
 	"context"
+	"fmt"
 
 	gv1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/google/go-containerregistry/pkg/v1/partial"
@@ -13,6 +14,25 @@ import (
 	"hauler.dev/go/hauler/v2/pkg/getter"
 )
 
+// emptyConfigDescriptor is the fixed OCI empty-config descriptor every file
+// artifact's manifest now uses, derived once from ocispec.DescriptorEmptyJSON
+// so the digest/size can't drift out of sync with RawConfig's returned bytes.
+// Built at package init rather than lazily: a failure here can only mean the
+// upstream image-spec constant itself is malformed, not a runtime condition,
+// so panicking at init is preferable to threading an error through every
+// caller of compute().
+var emptyConfigDescriptor = func() gv1.Descriptor {
+	h, err := gv1.NewHash(ocispec.DescriptorEmptyJSON.Digest.String())
+	if err != nil {
+		panic(fmt.Sprintf("file: malformed OCI empty config digest %q: %v", ocispec.DescriptorEmptyJSON.Digest.String(), err))
+	}
+	return gv1.Descriptor{
+		MediaType: gtypes.MediaType(ocispec.DescriptorEmptyJSON.MediaType),
+		Digest:    h,
+		Size:      ocispec.DescriptorEmptyJSON.Size,
+	}
+}()
+
 // interface guard
 var _ artifacts.OCI = (*File)(nil)
 
@@ -23,7 +43,6 @@ type File struct {
 
 	computed    bool
 	client      *getter.Client
-	config      artifacts.Config
 	blob        gv1.Layer
 	manifest    *gv1.Manifest
 	annotations map[string]string
@@ -64,7 +83,7 @@ func (f *File) RawConfig() ([]byte, error) {
 	if err := f.compute(); err != nil {
 		return nil, err
 	}
-	return f.config.Raw()
+	return ocispec.DescriptorEmptyJSON.Data, nil
 }
 
 func (f *File) Layers() ([]gv1.Layer, error) {
@@ -141,26 +160,31 @@ func (f *File) compute() error {
 	annotations[ocispec.AnnotationTitle] = f.client.Name(f.Path)
 	layer.Annotations = annotations
 
-	cfg := f.client.Config(f.Path)
-	if cfg == nil {
-		cfg = f.client.Config(f.Path)
-	}
-
-	cfgDesc, err := partial.Descriptor(cfg)
-	if err != nil {
-		return err
+	// Manifest-level annotations: the getter's own provenance (source URL,
+	// mtime/fetch-time) with any caller-supplied WithAnnotations merged in on
+	// top. Caller keys win on collision, but an unset f.annotations must not
+	// wipe out the provenance keys the caller never touched.
+	manifestAnnotations := f.client.Annotations(f.Path)
+	if f.annotations != nil {
+		if manifestAnnotations == nil {
+			manifestAnnotations = f.annotations
+		} else {
+			for k, v := range f.annotations {
+				manifestAnnotations[k] = v
+			}
+		}
 	}
 
 	m := &gv1.Manifest{
 		SchemaVersion: 2,
 		MediaType:     gtypes.MediaType(f.MediaType()),
-		Config:        *cfgDesc,
+		ArtifactType:  consts.FileArtifactType,
+		Config:        emptyConfigDescriptor,
 		Layers:        []gv1.Descriptor{*layer},
-		Annotations:   f.annotations,
+		Annotations:   manifestAnnotations,
 	}
 
 	f.manifest = m
-	f.config = cfg
 	f.blob = blob
 	f.computed = true
 	return nil

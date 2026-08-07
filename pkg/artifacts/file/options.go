@@ -3,7 +3,6 @@ package file
 import (
 	"context"
 
-	"hauler.dev/go/hauler/v2/pkg/artifacts"
 	"hauler.dev/go/hauler/v2/pkg/getter"
 )
 
@@ -21,12 +20,6 @@ func WithClient(c *getter.Client) Option {
 func WithContext(ctx context.Context) Option {
 	return func(f *File) {
 		f.ctx = ctx
-	}
-}
-
-func WithConfig(obj interface{}, mediaType string) Option {
-	return func(f *File) {
-		f.config = artifacts.ToConfig(obj, artifacts.WithConfigMediaType(mediaType))
 	}
 }
 

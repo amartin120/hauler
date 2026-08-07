@@ -34,24 +34,22 @@ func TestMain(m *testing.M) {
 	os.Exit(code)
 }
 
-func Test_file_Config(t *testing.T) {
+// Test_file_Manifest_NewShape proves every File artifact, regardless of
+// source, now emits the OCI-native empty-config manifest shape (the generic
+// artifact shape any oras/OCI 1.1 consumer understands) rather than a
+// hauler-private config media type.
+func Test_file_Manifest_NewShape(t *testing.T) {
 	tests := []struct {
-		name    string
-		ref     string
-		want    string
-		wantErr bool
+		name string
+		ref  string
 	}{
 		{
-			name:    "should properly type local file",
-			ref:     filename,
-			want:    consts.FileLocalConfigMediaType,
-			wantErr: false,
+			name: "local file",
+			ref:  filename,
 		},
 		{
-			name:    "should properly type remote file",
-			ref:     ts.URL + "/" + filename,
-			want:    consts.FileHttpConfigMediaType,
-			wantErr: false,
+			name: "remote http file",
+			ref:  ts.URL + "/" + filename,
 		},
 		// TODO: Add directory test
 	}
@@ -59,16 +57,31 @@ func Test_file_Config(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			f := file.NewFile(tt.ref, file.WithClient(mc))
 
-			f.MediaType()
-
 			m, err := f.Manifest()
 			if err != nil {
 				t.Fatal(err)
 			}
 
-			got := string(m.Config.MediaType)
-			if got != tt.want {
-				t.Errorf("unxpected mediatype; got %s, want %s", got, tt.want)
+			if got := string(m.Config.MediaType); got != consts.OCIEmptyConfigMediaType {
+				t.Errorf("unexpected config mediatype; got %s, want %s", got, consts.OCIEmptyConfigMediaType)
+			}
+			wantDigest := "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"
+			if got := m.Config.Digest.String(); got != wantDigest {
+				t.Errorf("unexpected config digest; got %s, want %s", got, wantDigest)
+			}
+			if m.Config.Size != 2 {
+				t.Errorf("unexpected config size; got %d, want 2", m.Config.Size)
+			}
+			if m.ArtifactType != consts.FileArtifactType {
+				t.Errorf("unexpected artifactType; got %s, want %s", m.ArtifactType, consts.FileArtifactType)
+			}
+
+			raw, err := f.RawConfig()
+			if err != nil {
+				t.Fatalf("RawConfig(): %v", err)
+			}
+			if string(raw) != "{}" {
+				t.Errorf("unexpected RawConfig() bytes; got %q, want %q", string(raw), "{}")
 			}
 		})
 	}

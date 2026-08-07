@@ -8,7 +8,8 @@ import (
 	"testing"
 	"time"
 
-	"hauler.dev/go/hauler/v2/pkg/artifacts"
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
+
 	"hauler.dev/go/hauler/v2/pkg/artifacts/file"
 	"hauler.dev/go/hauler/v2/pkg/getter"
 )
@@ -32,12 +33,11 @@ func (g *blockingGetter) Open(ctx context.Context, u *url.URL) (io.ReadCloser, e
 	}
 }
 
-func (g *blockingGetter) Detect(u *url.URL) bool { return true }
-func (g *blockingGetter) Name(u *url.URL) string { return "blocked" }
-func (g *blockingGetter) Config(u *url.URL) artifacts.Config {
-	return artifacts.ToConfig(struct {
-		Reference string `json:"reference"`
-	}{u.String()}, artifacts.WithConfigMediaType("application/vnd.test.config"))
+func (g *blockingGetter) Detect(u *url.URL) bool      { return true }
+func (g *blockingGetter) Name(u *url.URL) string      { return "blocked" }
+func (g *blockingGetter) MediaType(u *url.URL) string { return "application/octet-stream" }
+func (g *blockingGetter) Annotations(u *url.URL) map[string]string {
+	return map[string]string{ocispec.AnnotationURL: u.String()}
 }
 
 func newBlockingClient(g *blockingGetter) *getter.Client {

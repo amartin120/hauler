@@ -89,6 +89,39 @@ func TestFromManifest_OciImageConfigWithTitleAnnotation(t *testing.T) {
 	}
 }
 
+func TestFromManifest_EmptyConfigFile(t *testing.T) {
+	// New-shape file artifacts (pkg/artifacts/file's compute()) use the OCI
+	// empty config plus a real per-source layer media type. FromManifest must
+	// still dispatch to Files() so the title annotation drives extraction.
+	manifest := ocispec.Manifest{
+		Config: ocispec.Descriptor{
+			MediaType: consts.OCIEmptyConfigMediaType,
+		},
+		Layers: []ocispec.Descriptor{
+			{
+				MediaType: "text/plain",
+				Annotations: map[string]string{
+					ocispec.AnnotationTitle: "sha256sum-arm64.txt",
+				},
+			},
+		},
+	}
+
+	target, err := FromManifest(manifest, t.TempDir())
+	if err != nil {
+		t.Fatalf("expected no error, got: %v", err)
+	}
+	s, ok := target.(*store)
+	if !ok {
+		t.Fatal("expected target to be *store")
+	}
+	// consts.FileLayerMediaType is only registered by Files(), not Default(),
+	// so its presence proves FromManifest chose the Files() mapper.
+	if _, exists := s.mapper[consts.FileLayerMediaType]; !exists {
+		t.Fatal("expected Files() mapper (FileLayerMediaType key) for OCI empty config with titled layer")
+	}
+}
+
 func TestFromManifest_FileLayerFallback(t *testing.T) {
 	manifest := ocispec.Manifest{
 		Config: ocispec.Descriptor{

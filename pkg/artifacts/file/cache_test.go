@@ -11,7 +11,8 @@ import (
 	"testing"
 	"time"
 
-	"hauler.dev/go/hauler/v2/pkg/artifacts"
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
+
 	"hauler.dev/go/hauler/v2/pkg/artifacts/file"
 	"hauler.dev/go/hauler/v2/pkg/getter"
 )
@@ -42,12 +43,11 @@ func (g *countingGetter) Open(ctx context.Context, u *url.URL) (io.ReadCloser, e
 	return io.NopCloser(bytes.NewReader(g.data)), nil
 }
 
-func (g *countingGetter) Detect(u *url.URL) bool { return true }
-func (g *countingGetter) Name(u *url.URL) string { return "shared" }
-func (g *countingGetter) Config(u *url.URL) artifacts.Config {
-	return artifacts.ToConfig(struct {
-		Reference string `json:"reference"`
-	}{u.String()}, artifacts.WithConfigMediaType("application/vnd.test.config"))
+func (g *countingGetter) Detect(u *url.URL) bool      { return true }
+func (g *countingGetter) Name(u *url.URL) string      { return "shared" }
+func (g *countingGetter) MediaType(u *url.URL) string { return "application/octet-stream" }
+func (g *countingGetter) Annotations(u *url.URL) map[string]string {
+	return map[string]string{ocispec.AnnotationURL: u.String()}
 }
 
 func newCountingClient(g *countingGetter, nameOverride string) *getter.Client {
@@ -209,10 +209,9 @@ type fnGetter struct {
 func (g *fnGetter) Open(ctx context.Context, u *url.URL) (io.ReadCloser, error) {
 	return g.open(ctx, u)
 }
-func (g *fnGetter) Detect(u *url.URL) bool { return true }
-func (g *fnGetter) Name(u *url.URL) string { return g.name }
-func (g *fnGetter) Config(u *url.URL) artifacts.Config {
-	return artifacts.ToConfig(struct {
-		Reference string `json:"reference"`
-	}{u.String()}, artifacts.WithConfigMediaType("application/vnd.test.config"))
+func (g *fnGetter) Detect(u *url.URL) bool      { return true }
+func (g *fnGetter) Name(u *url.URL) string      { return g.name }
+func (g *fnGetter) MediaType(u *url.URL) string { return "application/octet-stream" }
+func (g *fnGetter) Annotations(u *url.URL) map[string]string {
+	return map[string]string{ocispec.AnnotationURL: u.String()}
 }

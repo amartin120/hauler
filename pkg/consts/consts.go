@@ -21,10 +21,27 @@ const (
 	ProvLayerMediaType   = "application/vnd.cncf.helm.chart.provenance.v1.prov"
 
 	// file media types
+	//
+	// FileLayerMediaType and the three File*ConfigMediaType constants below are
+	// read-only legacy: a new file artifact never writes them (see
+	// pkg/artifacts/file's compute(), which now emits a real per-source layer
+	// media type and the fixed OCI empty config). They are retained solely so
+	// artifacts.Classify and internal/mapper.Files() can still recognize an
+	// old-format manifest on read.
 	FileLayerMediaType           = "application/vnd.content.hauler.file.layer.v1"
 	FileLocalConfigMediaType     = "application/vnd.content.hauler.file.local.config.v1+json"
 	FileDirectoryConfigMediaType = "application/vnd.content.hauler.file.directory.config.v1+json"
 	FileHttpConfigMediaType      = "application/vnd.content.hauler.file.http.config.v1+json"
+
+	// FileArtifactType is the manifest-level artifactType a file artifact now
+	// writes. Sourced from oras.land/oras-go/v2's exported MediaTypeUnknownArtifact
+	// constant (pack.go) -- hardcoded here rather than imported, matching the
+	// sourcing-comment convention already used below for the cosign referrer
+	// artifactType constants, since oras-go is only an indirect dependency.
+	FileArtifactType = "application/vnd.unknown.artifact.v1"
+
+	// memory media types
+	MemoryConfigMediaType = "application/vnd.content.hauler.memory.config.v1+json"
 
 	// wasm media types
 	WasmArtifactLayerMediaType = "application/vnd.wasm.content.layer.v1+wasm"

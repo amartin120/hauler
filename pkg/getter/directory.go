@@ -5,16 +5,15 @@ import (
 	"compress/gzip"
 	"context"
 	"io"
+	"mime"
 	"net/url"
 	"os"
 	"path/filepath"
 	"time"
 
 	"github.com/opencontainers/go-digest"
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
-
-	"hauler.dev/go/hauler/v2/pkg/artifacts"
-	"hauler.dev/go/hauler/v2/pkg/consts"
 )
 
 type directory struct {
@@ -78,15 +77,35 @@ func (d directory) Detect(u *url.URL) bool {
 	return fi.IsDir()
 }
 
-func (d directory) Config(u *url.URL) artifacts.Config {
-	c := &directoryConfig{
-		config{Reference: u.String()},
+// MediaType detects the OCI media type from the directory's own path
+// extension. Directory names rarely carry a recognized extension, so this
+// almost always falls back to application/octet-stream -- harmless, since
+// the bundle is tar+gzip bytes regardless of the declared media type, and
+// content.AnnotationUnpack (set in Client.LayerFrom) is what actually signals
+// "this needs untarring" downstream.
+func (d directory) MediaType(u *url.URL) string {
+	mt := mime.TypeByExtension(filepath.Ext(d.path(u)))
+	if mt == "" {
+		return "application/octet-stream"
 	}
-	return artifacts.ToConfig(c, artifacts.WithConfigMediaType(consts.FileDirectoryConfigMediaType))
+	t, _, err := mime.ParseMediaType(mt)
+	if err != nil || t == "" {
+		return "application/octet-stream"
+	}
+	return t
 }
 
-type directoryConfig struct {
-	config `json:",inline,omitempty"`
+// Annotations returns manifest-level provenance annotations for a directory
+// source: the source path always, plus the directory's own mtime when
+// os.Stat succeeds, mirroring File.Annotations.
+func (d directory) Annotations(u *url.URL) map[string]string {
+	ann := map[string]string{
+		ocispec.AnnotationURL: u.String(),
+	}
+	if fi, err := os.Stat(d.path(u)); err == nil {
+		ann[ocispec.AnnotationCreated] = fi.ModTime().UTC().Format(time.RFC3339)
+	}
+	return ann
 }
 
 func tarDir(root string, prefix string, w io.Writer, stripTimes bool) error {
