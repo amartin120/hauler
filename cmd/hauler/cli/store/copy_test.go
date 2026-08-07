@@ -664,3 +664,44 @@ func TestCopyCmd_Dir_Charts(t *testing.T) {
 		t.Errorf("no .tgz found in destDir after chart copy... found: %v", names)
 	}
 }
+
+// TestCopyCmd_Dir_TwoNoTitleChartsNoFilenameCollision pins Part 2 of the
+// OCI-passthrough change: internal/mapper.Chart's fallback for a layer with no
+// org.opencontainers.image.title annotation -- the shape every OCI-passthrough
+// chart carries, since upstream Helm-OCI publishers never set that annotation
+// (see fetchChart's registry.IsOCI branch in add.go) -- now derives
+// "<name>-<version>.tgz" from the chart's own ref instead of the fixed
+// literal "chart.tar.gz", which would otherwise collide any two such charts
+// into one silently overwritten file.
+func TestCopyCmd_Dir_TwoNoTitleChartsNoFilenameCollision(t *testing.T) {
+	ctx := newTestContext(t)
+	s := newTestStore(t)
+	ro := defaultCliOpts()
+
+	seedNoTitleChartManifest(t, s, "myorg/chart-one:1.0.0", []byte("chart one contents"))
+	seedNoTitleChartManifest(t, s, "myorg/chart-two:2.0.0", []byte("chart two contents"))
+
+	destDir := t.TempDir()
+	copyOpts := &flags.CopyOpts{StoreRootOpts: defaultRootOpts(s.Root)}
+	if err := CopyCmd(ctx, copyOpts, s, "dir://"+destDir, ro); err != nil {
+		t.Fatalf("CopyCmd dir: %v", err)
+	}
+
+	for _, want := range []string{"chart-one-1.0.0.tgz", "chart-two-2.0.0.tgz"} {
+		if _, err := os.Stat(filepath.Join(destDir, want)); err != nil {
+			t.Errorf("expected extracted file %q, got: %v", want, err)
+		}
+	}
+
+	entries, err := os.ReadDir(destDir)
+	if err != nil {
+		t.Fatalf("ReadDir: %v", err)
+	}
+	if len(entries) != 2 {
+		names := make([]string, len(entries))
+		for i, e := range entries {
+			names[i] = e.Name()
+		}
+		t.Errorf("expected exactly 2 extracted files (no collision), got %d: %v", len(entries), names)
+	}
+}

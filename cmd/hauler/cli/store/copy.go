@@ -97,8 +97,10 @@ func CopyCmd(ctx context.Context, o *flags.CopyOpts, s *store.Layout, targetRef 
 						continue
 					}
 
-					// Create mapper and extract
-					mapperStore, err := mapper.FromManifest(m, components[1])
+					// Create mapper and extract. reference is the parent index's
+					// ref -- there is no more specific per-child ref available,
+					// since index children aren't independently indexed.
+					mapperStore, err := mapper.FromManifest(m, components[1], reference)
 					if err != nil {
 						l.Warnf("failed to create mapper for child: %v", err)
 						continue
@@ -140,7 +142,7 @@ func CopyCmd(ctx context.Context, o *flags.CopyOpts, s *store.Layout, targetRef 
 				}
 
 				// Create a mapper store based on the manifest type
-				mapperStore, err := mapper.FromManifest(m, components[1])
+				mapperStore, err := mapper.FromManifest(m, components[1], reference)
 				if err != nil {
 					rc.Close()
 					l.Warnf("failed to create mapper for [%s]: %v", reference, err)

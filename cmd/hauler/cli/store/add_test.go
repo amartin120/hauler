@@ -8,6 +8,7 @@ import (
 	"crypto/rand"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"fmt"
@@ -20,6 +21,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -3042,4 +3044,234 @@ func writeCAFile(t *testing.T) string {
 		t.Fatal(err)
 	}
 	return p
+} 
+
+// --------------------------------------------------------------------------
+// OCI chart passthrough tests (fetchChart's registry.IsOCI branch)
+// --------------------------------------------------------------------------
+
+// ociPassthroughChartRepo and ociPassthroughChartTag name the repo/tag every
+// OCI-passthrough test below seeds chart-with-file-dependency-chart-1.0.0.tgz
+// under.
+const (
+	ociPassthroughChartRepo = "testrepo/chart-with-file-dependency-chart"
+	ociPassthroughChartTag  = "1.0.0"
+)
+
+// readTestChartTgz reads the shared file-dependency chart fixture's raw
+// archive bytes, real enough for chrt.Load() to parse a genuine chart out of.
+func readTestChartTgz(t *testing.T) []byte {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join(chartTestdataDir, "chart-with-file-dependency-chart-1.0.0.tgz"))
+	if err != nil {
+		t.Fatalf("reading chart fixture: %v", err)
+	}
+	return data
+}
+
+// newOCIPassthroughChartOpts builds AddChartOpts pointed at an OCI chart
+// repository on host, matching the shape resolveChartJobs/AddChartCmd expect:
+// RepoURL is "oci://<host>/<parent>" and the chart name is joined on by
+// chart.NewChart itself, mirroring chart.go's own chartRef construction.
+func newOCIPassthroughChartOpts(host string) *flags.AddChartOpts {
+	return &flags.AddChartOpts{
+		ChartOpts: &action.ChartPathOptions{
+			RepoURL:   "oci://" + host + "/testrepo",
+			Version:   ociPassthroughChartTag,
+			PlainHTTP: true,
+		},
+		Concurrency: consts.DefaultConcurrency,
+	}
+}
+
+// TestFetchChart_OCIPassthrough_PreservesUpstreamManifest is the core proof
+// for Part 1: an OCI-sourced chart must be stored with the publisher's exact
+// manifest bytes -- not hauler's rebuilt one -- so the digest matches what the
+// publisher signed and none of the publisher's manifest-level annotations
+// (authors, created, description, source, title, url, version) are dropped.
+func TestFetchChart_OCIPassthrough_PreservesUpstreamManifest(t *testing.T) {
+	ctx := newTestContext(t)
+	host, _ := newTestRegistry(t)
+
+	chartTgz := readTestChartTgz(t)
+	wantManifest, wantDigest := seedOCIChartManifest(t, host, ociPassthroughChartRepo, ociPassthroughChartTag, chartTgz, ociChartManifestAnnotations(ociPassthroughChartTag))
+
+	s := newTestStore(t)
+	rso := defaultRootOpts(s.Root)
+	ro := defaultCliOpts()
+
+	o := newOCIPassthroughChartOpts(host)
+	if err := AddChartCmd(ctx, o, s, "chart-with-file-dependency-chart", rso, ro); err != nil {
+		t.Fatalf("AddChartCmd: %v", err)
+	}
+
+	wantRef := ociPassthroughChartRepo + ":" + ociPassthroughChartTag
+	if got := storedDigest(t, s, wantRef); got != wantDigest.String() {
+		t.Fatalf("stored digest = %s, want %s (upstream manifest digest)", got, wantDigest.String())
+	}
+
+	gotManifest := fetchStoredManifestBytes(t, s, wantRef)
+	if !bytes.Equal(gotManifest, wantManifest) {
+		t.Fatalf("stored manifest bytes differ from upstream:\ngot:  %s\nwant: %s", gotManifest, wantManifest)
+	}
+
+	var decoded ocispec.Manifest
+	if err := json.Unmarshal(gotManifest, &decoded); err != nil {
+		t.Fatalf("decoding stored manifest: %v", err)
+	}
+	for _, key := range []string{
+		ocispec.AnnotationAuthors,
+		ocispec.AnnotationCreated,
+		ocispec.AnnotationDescription,
+		ocispec.AnnotationSource,
+		ocispec.AnnotationTitle,
+		ocispec.AnnotationURL,
+		ocispec.AnnotationVersion,
+	} {
+		if _, ok := decoded.Annotations[key]; !ok {
+			t.Errorf("stored manifest missing upstream annotation %q", key)
+		}
+	}
+
+	assertArtifactClassifiesAs(t, s, wantRef, artifacts.KindChart)
+}
+
+// TestFetchChart_ClassicSource_RewrapUnaffected is a regression test: a chart
+// sourced from a non-OCI location (a local .tgz here, matching
+// TestAddChartCmd_LocalTgz) must produce the identical classic
+// "<name>:<version>" ref (no registry) via the AddArtifact rewrap path --
+// registry.IsOCI(RepoURL) must gate Part 1's passthrough branch off entirely
+// for this case, with no digest or behavior change from before Part 1.
+// TestFetchChart_AuditReference_MatchesStoredRef pins a chart audit entry's
+// Reference to the ref the chart is actually stored under, for both source
+// kinds. The two had drifted: the entry recorded c.Name()+":"+version, which
+// omits the "hauler/" default namespace reference.Parse prepends to any name
+// without a slash, so the audit log named a ref that did not exist in the
+// index. Pinned rather than left implicit because audit output is consumed by
+// external tooling, and because the fix rides along with an unrelated feature
+// -- without this, reverting it would look like a no-op cleanup.
+func TestFetchChart_AuditReference_MatchesStoredRef(t *testing.T) {
+	ctx := newTestContext(t)
+	s := newTestStore(t)
+	rso := defaultRootOpts(s.Root)
+	ro := defaultCliOpts()
+	// "standard" is the level a real run defaults to, and the one where
+	// Reference is written but Flags is not -- so this pins the field on the
+	// path users actually take, not just the verbose one.
+	ro.AuditLevel = "standard"
+	ro.HaulerDir = t.TempDir()
+
+	o := newAddChartOpts(chartTestdataDir, "")
+	o.Concurrency = consts.DefaultConcurrency
+	if err := AddChartCmd(ctx, o, s, "rancher-cluster-templates-0.5.2.tgz", rso, ro); err != nil {
+		t.Fatalf("AddChartCmd: %v", err)
+	}
+
+	const want = "hauler/rancher-cluster-templates:0.5.2"
+	if got := lastAuditEntryReference(t, ro.HaulerDir); got != want {
+		t.Errorf("audit Reference = %q, want %q", got, want)
+	}
+
+	// The pin only means something if it names a ref the store really holds --
+	// an exact match, since storedDigest's substring search would also accept
+	// the un-namespaced form this test exists to rule out.
+	refs := storedRefNames(t, s)
+	if !slices.Contains(refs, want) {
+		t.Errorf("no artifact stored under %q; index holds %v", want, refs)
+	}
+}
+
+func TestFetchChart_ClassicSource_RewrapUnaffected(t *testing.T) {
+	ctx := newTestContext(t)
+	s := newTestStore(t)
+	rso := defaultRootOpts(s.Root)
+	ro := defaultCliOpts()
+
+	o := newAddChartOpts(chartTestdataDir, "")
+	o.Concurrency = consts.DefaultConcurrency
+	if err := AddChartCmd(ctx, o, s, "rancher-cluster-templates-0.5.2.tgz", rso, ro); err != nil {
+		t.Fatalf("AddChartCmd: %v", err)
+	}
+
+	wantRef := "rancher-cluster-templates:0.5.2"
+	if got := storedDigest(t, s, wantRef); got == "" {
+		t.Fatalf("expected chart stored under classic ref %q, none found", wantRef)
+	}
+	assertArtifactClassifiesAs(t, s, wantRef, artifacts.KindChart)
+}
+
+// TestFetchChart_OCIPassthrough_FallbackOnRegistryFailure proves that when
+// Helm's own chart.NewChart/Load succeeds against an OCI repo but hauler's own
+// independent AddImage fetch of that same ref subsequently fails, fetchChart
+// warns and falls back to the AddArtifact rewrap path rather than failing the
+// whole chart add -- availability over provenance is the explicit design
+// intent (see fetchChart's doc comment on the OCI-passthrough branch).
+//
+// failAfterNManifestGETs lets exactly one manifest GET through (Helm's own
+// pull) and fails every one after it (AddImage's independent remote.Get),
+// simulating a registry that becomes unreachable between the two fetches.
+func TestFetchChart_OCIPassthrough_FallbackOnRegistryFailure(t *testing.T) {
+	chartTgz := readTestChartTgz(t)
+
+	fh := &failAfterNManifestGETs{next: registry.New(), pathSuffix: "/manifests/" + ociPassthroughChartTag, n: 1}
+	srv := httptest.NewServer(fh)
+	t.Cleanup(srv.Close)
+	host := strings.TrimPrefix(srv.URL, "http://")
+
+	seedOCIChartManifest(t, host, ociPassthroughChartRepo, ociPassthroughChartTag, chartTgz, ociChartManifestAnnotations(ociPassthroughChartTag))
+
+	s := newTestStore(t)
+	rso := defaultRootOpts(s.Root)
+	ro := defaultCliOpts()
+
+	var buf bytes.Buffer
+	zl := zerolog.New(&buf).Level(zerolog.WarnLevel)
+	ctx := zl.WithContext(context.Background())
+
+	o := newOCIPassthroughChartOpts(host)
+	if err := AddChartCmd(ctx, o, s, "chart-with-file-dependency-chart", rso, ro); err != nil {
+		t.Fatalf("AddChartCmd: %v", err)
+	}
+
+	if !strings.Contains(buf.String(), "without upstream provenance") {
+		t.Errorf("expected a WARN log about storing without upstream provenance, got:\n%s", buf.String())
+	}
+
+	// The chart must still land in the store via the rewrap path, under the
+	// classic ref shape AddArtifact has always produced.
+	assertArtifactInStore(t, s, "chart-with-file-dependency-chart:1.0.0")
+}
+
+// TestRunChartJobs_OCIPassthrough_DependenciesAndImages proves --add-dependencies
+// and --add-images still work for an OCI-sourced chart exactly as they do for
+// an HTTP-sourced one: chart-with-file-dependency-chart's file:// dependencies
+// (child, crds) and its templated image reference are both discovered and
+// stored regardless of which path fetchChart took to store the parent chart.
+func TestRunChartJobs_OCIPassthrough_DependenciesAndImages(t *testing.T) {
+	ctx := newTestContext(t)
+	host, _ := newTestRegistry(t)
+
+	chartTgz := readTestChartTgz(t)
+	seedOCIChartManifest(t, host, ociPassthroughChartRepo, ociPassthroughChartTag, chartTgz, ociChartManifestAnnotations(ociPassthroughChartTag))
+
+	s := newTestStore(t)
+	rso := defaultRootOpts(s.Root)
+	ro := defaultCliOpts()
+
+	o := newOCIPassthroughChartOpts(host)
+	o.AddDependencies = true
+	o.AddImages = true
+	o.ValuesFiles = []string{
+		filepath.Join(chartTestdataDir, "chart-with-file-dependency-chart-required-values.yaml"),
+		filepath.Join(chartTestdataDir, "chart-with-file-dependency-chart-required-values-2.yaml"),
+	}
+
+	if err := AddChartCmd(ctx, o, s, "chart-with-file-dependency-chart", rso, ro); err != nil {
+		t.Fatalf("AddChartCmd: %v", err)
+	}
+
+	assertArtifactInStore(t, s, "chart-with-file-dependency-chart:1.0.0")
+	assertArtifactInStore(t, s, "child:2.0.0")
+	assertArtifactInStore(t, s, "crds:0.0.1")
+	assertArtifactInStore(t, s, "hauler-dev/library/busybox:musl")
 }

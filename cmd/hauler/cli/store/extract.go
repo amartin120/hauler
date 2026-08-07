@@ -143,7 +143,9 @@ func ExtractCmd(ctx context.Context, o *flags.ExtractOpts, s *store.Layout, ref 
 			return nil
 		}
 
-		mapperStore, err := mapper.FromManifest(m, o.DestinationDir)
+		// reference is the s.Walk closure parameter (the string, not the
+		// hauler.dev/go/hauler/v2/pkg/reference package imported above).
+		mapperStore, err := mapper.FromManifest(m, o.DestinationDir, reference)
 		if err != nil {
 			return err
 		}

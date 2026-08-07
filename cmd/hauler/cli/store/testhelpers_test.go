@@ -16,6 +16,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
+	"fmt"
 	"io"
 	golog "log"
 	"net/http"
@@ -24,6 +25,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/google/go-containerregistry/pkg/name"
@@ -36,6 +38,7 @@ import (
 	"github.com/google/go-containerregistry/pkg/v1/static"
 	gvtypes "github.com/google/go-containerregistry/pkg/v1/types"
 	digest "github.com/opencontainers/go-digest"
+	specs "github.com/opencontainers/image-spec/specs-go"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/rs/zerolog"
 	ociempty "github.com/sigstore/cosign/v3/pkg/oci/empty"
@@ -164,6 +167,140 @@ func newTestRegistry(t *testing.T) (host string, remoteOpts []remote.Option) {
 	host = strings.TrimPrefix(srv.URL, "http://")
 	remoteOpts = []remote.Option{remote.WithTransport(srv.Client().Transport)}
 	return host, remoteOpts
+}
+
+// pushBlobPlain uploads data as a blob to host/repo via a single monolithic
+// POST (?digest=<digest>), bypassing go-containerregistry's own blob-write
+// path entirely so a manifest built by hand (pushManifestPlain) can reference
+// it without any of go-containerregistry's own types touching the bytes.
+// Returns the blob's digest.
+func pushBlobPlain(t *testing.T, host, repo string, data []byte) digest.Digest {
+	t.Helper()
+	dgst := digest.FromBytes(data)
+	url := fmt.Sprintf("http://%s/v2/%s/blobs/uploads/?digest=%s", host, repo, dgst.String())
+	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(data))
+	if err != nil {
+		t.Fatalf("pushBlobPlain: NewRequest: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/octet-stream")
+	req.ContentLength = int64(len(data))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("pushBlobPlain: Do: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("pushBlobPlain: unexpected status %d: %s", resp.StatusCode, body)
+	}
+	return dgst
+}
+
+// pushManifestPlain PUTs data (already-serialized manifest bytes) to
+// host/repo:tag directly via http.Client -- never remote.Write/mutate, which
+// would re-serialize through go-containerregistry's own types and could
+// silently normalize away the exact bytes a test is pinning. Returns the
+// manifest's digest.
+func pushManifestPlain(t *testing.T, host, repo, tag, contentType string, data []byte) digest.Digest {
+	t.Helper()
+	url := fmt.Sprintf("http://%s/v2/%s/manifests/%s", host, repo, tag)
+	req, err := http.NewRequest(http.MethodPut, url, bytes.NewReader(data))
+	if err != nil {
+		t.Fatalf("pushManifestPlain: NewRequest: %v", err)
+	}
+	req.Header.Set("Content-Type", contentType)
+	req.ContentLength = int64(len(data))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("pushManifestPlain: Do: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("pushManifestPlain: unexpected status %d: %s", resp.StatusCode, body)
+	}
+	return digest.FromBytes(data)
+}
+
+// ociChartManifestAnnotations returns a representative set of manifest-level
+// annotations a real Helm-OCI publisher writes (authors, created,
+// description, source, title, url, version) -- used by the OCI-passthrough
+// tests to prove none of them are dropped by storing the chart as-is.
+func ociChartManifestAnnotations(version string) map[string]string {
+	return map[string]string{
+		ocispec.AnnotationAuthors:     "Test Publisher <test@example.com>",
+		ocispec.AnnotationCreated:     "2024-01-01T00:00:00Z",
+		ocispec.AnnotationDescription: "A test chart for OCI passthrough",
+		ocispec.AnnotationSource:      "https://github.com/example/chart-with-file-dependency-chart",
+		ocispec.AnnotationTitle:       "chart-with-file-dependency-chart",
+		ocispec.AnnotationURL:         "https://example.com/charts/chart-with-file-dependency-chart",
+		ocispec.AnnotationVersion:     version,
+	}
+}
+
+// seedOCIChartManifest hand-crafts and pushes an upstream-shaped OCI Helm
+// chart manifest to host/repo:tag -- manifest-level annotations, no
+// layer-level org.opencontainers.image.title, and no top-level "mediaType"
+// JSON field (real publishers commonly omit it, relying on the registry's
+// Content-Type response header instead, exactly as
+// ghcr.io/nginxinc/charts/nginx-ingress does). chartTgz must be real chart
+// archive bytes so chrt.Load() can parse a chart out of it later. Returns the
+// manifest's raw bytes and digest so a test can assert the store recorded
+// them byte-for-byte.
+func seedOCIChartManifest(t *testing.T, host, repo, tag string, chartTgz []byte, annotations map[string]string) ([]byte, digest.Digest) {
+	t.Helper()
+
+	configData := []byte(`{"name":"` + repo + `","version":"` + tag + `"}`)
+	configDigest := pushBlobPlain(t, host, repo, configData)
+	layerDigest := pushBlobPlain(t, host, repo, chartTgz)
+
+	manifest := ocispec.Manifest{
+		Versioned: specs.Versioned{SchemaVersion: 2},
+		Config: ocispec.Descriptor{
+			MediaType: consts.ChartConfigMediaType,
+			Digest:    configDigest,
+			Size:      int64(len(configData)),
+		},
+		Layers: []ocispec.Descriptor{
+			{
+				MediaType: consts.ChartLayerMediaType,
+				Digest:    layerDigest,
+				Size:      int64(len(chartTgz)),
+			},
+		},
+		Annotations: annotations,
+	}
+	data, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatalf("seedOCIChartManifest: marshal manifest: %v", err)
+	}
+
+	dgst := pushManifestPlain(t, host, repo, tag, ocispec.MediaTypeImageManifest, data)
+	return data, dgst
+}
+
+// failAfterNManifestGETs wraps an http.Handler and returns a 500 for every GET
+// request whose path has the given suffix beyond the first n such requests.
+// It simulates a registry that serves a chart puller's first, successful
+// fetch (e.g. Helm's own OCI pull during chart.NewChart) but has become
+// unreachable by the time a second, independent fetch of the same ref runs
+// (e.g. store.Layout.AddImage's own remote.Get) -- used to pin fetchChart's
+// OCI-passthrough fallback to the rewrap path.
+type failAfterNManifestGETs struct {
+	next       http.Handler
+	pathSuffix string
+	n          int32
+	seen       int32
+}
+
+func (h *failAfterNManifestGETs) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, h.pathSuffix) {
+		if atomic.AddInt32(&h.seen, 1) > h.n {
+			http.Error(w, "simulated registry failure", http.StatusInternalServerError)
+			return
+		}
+	}
+	h.next.ServeHTTP(w, r)
 }
 
 // recordingHandler records the path of every request it serves before
@@ -452,6 +589,51 @@ func seedManifestDescriptor(t *testing.T, s *store.Layout, m ocispec.Manifest, a
 	return desc
 }
 
+// seedNoTitleChartManifest writes a chart manifest directly into s's store --
+// no live registry involved -- with a config media type that classifies as a
+// chart (artifacts.Classify's Rule 4) and a single layer carrying no
+// org.opencontainers.image.title annotation, the shape an OCI-passthrough
+// chart (fetchChart's registry.IsOCI branch) produces. ref is the chart's
+// store reference (e.g. "myorg/mychart:1.0.0").
+func seedNoTitleChartManifest(t *testing.T, s *store.Layout, ref string, layerContent []byte) {
+	t.Helper()
+
+	configData := []byte(`{}`)
+	configDigest := digest.FromBytes(configData)
+	if err := s.OCI.WriteBlob(context.Background(), configDigest, int64(len(configData)), func() (io.ReadCloser, error) {
+		return io.NopCloser(bytes.NewReader(configData)), nil
+	}); err != nil {
+		t.Fatalf("seedNoTitleChartManifest: WriteBlob config: %v", err)
+	}
+
+	layerDigest := digest.FromBytes(layerContent)
+	if err := s.OCI.WriteBlob(context.Background(), layerDigest, int64(len(layerContent)), func() (io.ReadCloser, error) {
+		return io.NopCloser(bytes.NewReader(layerContent)), nil
+	}); err != nil {
+		t.Fatalf("seedNoTitleChartManifest: WriteBlob layer: %v", err)
+	}
+
+	m := ocispec.Manifest{
+		Versioned: specs.Versioned{SchemaVersion: 2},
+		Config: ocispec.Descriptor{
+			MediaType: consts.ChartConfigMediaType,
+			Digest:    configDigest,
+			Size:      int64(len(configData)),
+		},
+		Layers: []ocispec.Descriptor{
+			{
+				MediaType: consts.ChartLayerMediaType,
+				Digest:    layerDigest,
+				Size:      int64(len(layerContent)),
+			},
+		},
+	}
+
+	seedManifestDescriptor(t, s, m, map[string]string{
+		ocispec.AnnotationRefName: ref,
+	})
+}
+
 // assertArtifactClassifiesAs walks the store, decodes the manifest of the
 // first descriptor whose ref.name contains refSubstring, and fails unless
 // artifacts.Classify reports want.
@@ -501,6 +683,39 @@ func storedDigest(t *testing.T, s *store.Layout, refSubstring string) string {
 	return found
 }
 
+// fetchStoredManifestBytes walks the store for the descriptor whose
+// AnnotationRefName exactly equals ref, fetches it, and returns its raw
+// manifest bytes -- used to assert a manifest was stored byte-for-byte, which
+// a decoded/re-marshaled comparison would not catch (e.g. Go's encoding/json
+// silently reordering fields).
+func fetchStoredManifestBytes(t *testing.T, s *store.Layout, ref string) []byte {
+	t.Helper()
+	var desc ocispec.Descriptor
+	found := false
+	if err := s.OCI.Walk(func(_ string, d ocispec.Descriptor) error {
+		if !found && d.Annotations[ocispec.AnnotationRefName] == ref {
+			desc = d
+			found = true
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("fetchStoredManifestBytes walk: %v", err)
+	}
+	if !found {
+		t.Fatalf("no descriptor with ref %q found in store", ref)
+	}
+	rc, err := s.Fetch(context.Background(), desc)
+	if err != nil {
+		t.Fatalf("fetchStoredManifestBytes: fetch %s: %v", desc.Digest, err)
+	}
+	defer rc.Close()
+	data, err := io.ReadAll(rc)
+	if err != nil {
+		t.Fatalf("fetchStoredManifestBytes: read %s: %v", desc.Digest, err)
+	}
+	return data
+}
+
 // lastAuditEntryFlags reads <haulerDir>/audit.log (see pkg/audit.Append /
 // resolveDir) and returns the "flags" object of its last JSON line -- only
 // populated at audit level "verbose", since audit.Append omits Flags
@@ -522,6 +737,45 @@ func lastAuditEntryFlags(t *testing.T, haulerDir string) map[string]any {
 		t.Fatalf("unmarshaling last audit.log line: %v\nline: %s", err, lines[len(lines)-1])
 	}
 	return entry.Flags
+}
+
+// lastAuditEntryReference reads <haulerDir>/audit.log and returns the
+// "reference" field of its last JSON line. Unlike Flags, Reference is written
+// at every audit level except "none", so callers need not set "verbose".
+func lastAuditEntryReference(t *testing.T, haulerDir string) string {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join(haulerDir, "audit.log"))
+	if err != nil {
+		t.Fatalf("reading audit.log: %v", err)
+	}
+	lines := strings.Split(strings.TrimRight(string(data), "\n"), "\n")
+	if len(lines) == 0 || lines[len(lines)-1] == "" {
+		t.Fatalf("audit.log has no entries")
+	}
+	var entry struct {
+		Reference string `json:"reference"`
+	}
+	if err := json.Unmarshal([]byte(lines[len(lines)-1]), &entry); err != nil {
+		t.Fatalf("unmarshaling last audit.log line: %v\nline: %s", err, lines[len(lines)-1])
+	}
+	return entry.Reference
+}
+
+// storedRefNames returns every org.opencontainers.image.ref.name in the store
+// index, for assertions that need an exact match rather than storedDigest's
+// substring search.
+func storedRefNames(t *testing.T, s *store.Layout) []string {
+	t.Helper()
+	var refs []string
+	if err := s.OCI.Walk(func(_ string, desc ocispec.Descriptor) error {
+		if r := desc.Annotations[ocispec.AnnotationRefName]; r != "" {
+			refs = append(refs, r)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("storedRefNames walk: %v", err)
+	}
+	return refs
 }
 
 // countArtifactsInStore returns the number of descriptors in the store index.

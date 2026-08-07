@@ -2,6 +2,7 @@ package mapper
 
 import (
 	"fmt"
+	"strings"
 
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 
@@ -14,11 +15,14 @@ type Fn func(desc ocispec.Descriptor) (string, error)
 
 // FromManifest returns the appropriate content store for extracting manifest's
 // layers to disk, routed by artifacts.Classify's content-derived Kind rather
-// than by which subcommand originally wrote the manifest.
-func FromManifest(manifest ocispec.Manifest, root string) (content.Target, error) {
+// than by which subcommand originally wrote the manifest. ref is the artifact's
+// store reference (e.g. "myrepo/mychart:1.0.0"), used by Chart's mapper to name
+// the extracted chart archive when the manifest carries no title annotation --
+// see Chart's doc comment.
+func FromManifest(manifest ocispec.Manifest, root string, ref string) (content.Target, error) {
 	switch artifacts.Classify(ocispec.Descriptor{MediaType: string(manifest.MediaType)}, &manifest) {
 	case artifacts.KindChart:
-		return NewMapperFileStore(root, Chart())
+		return NewMapperFileStore(root, Chart(ref))
 	case artifacts.KindFile:
 		return NewMapperFileStore(root, Files())
 	case artifacts.KindImage:
@@ -58,15 +62,23 @@ func Images() map[string]Fn {
 	return m
 }
 
-func Chart() map[string]Fn {
+// Chart returns the mapper for extracting a Helm chart manifest's layers to
+// disk. ref names the chart being extracted (e.g. "myrepo/mychart:1.0.0")
+// and is only consulted when a layer carries no org.opencontainers.image.title
+// annotation -- the shape every chart stored via the old rewrap path
+// (pkg/artifacts/chart's chartData()) carries, but which upstream OCI Helm
+// charts never do. Passing ref="" keeps the literal "chart.tar.gz" fallback.
+func Chart(ref string) map[string]Fn {
 	m := make(map[string]Fn)
 
 	chartMapperFn := Fn(func(desc ocispec.Descriptor) (string, error) {
-		f := "chart.tar.gz"
-		if _, ok := desc.Annotations[ocispec.AnnotationTitle]; ok {
-			f = desc.Annotations[ocispec.AnnotationTitle]
+		if title, ok := desc.Annotations[ocispec.AnnotationTitle]; ok {
+			return title, nil
 		}
-		return f, nil
+		if derived := deriveChartFilename(ref); derived != "" {
+			return derived, nil
+		}
+		return "chart.tar.gz", nil
 	})
 
 	provMapperFn := Fn(func(desc ocispec.Descriptor) (string, error) {
@@ -76,6 +88,39 @@ func Chart() map[string]Fn {
 	m[consts.ChartLayerMediaType] = chartMapperFn
 	m[consts.ProvLayerMediaType] = provMapperFn
 	return m
+}
+
+// deriveChartFilename derives a "<name>-<version>.tgz" (or "<name>.tgz" with
+// no version) extraction filename from a chart store reference, e.g.
+// "ghcr.io/nginxinc/charts/nginx-ingress:2.0.0" -> "nginx-ingress-2.0.0.tgz".
+// Returns "" if ref is empty or no name can be derived, leaving the caller to
+// fall back to a fixed literal.
+func deriveChartFilename(ref string) string {
+	if ref == "" {
+		return ""
+	}
+	// Drop a digest suffix ("repo@sha256:...") -- only the tag form carries a
+	// human-readable version.
+	if i := strings.Index(ref, "@"); i >= 0 {
+		ref = ref[:i]
+	}
+
+	name, version := ref, ""
+	// The last ':' names a tag only if it comes after the last '/' -- an
+	// earlier one is a registry port (e.g. "localhost:5000/repo").
+	if i := strings.LastIndex(ref, ":"); i >= 0 && i > strings.LastIndex(ref, "/") {
+		name, version = ref[:i], ref[i+1:]
+	}
+	if i := strings.LastIndex(name, "/"); i >= 0 {
+		name = name[i+1:]
+	}
+	if name == "" {
+		return ""
+	}
+	if version == "" {
+		return name + ".tgz"
+	}
+	return name + "-" + version + ".tgz"
 }
 
 // DefaultCatchAll is the sentinel key used in a mapper map to match any media type

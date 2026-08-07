@@ -17,7 +17,7 @@ func TestFromManifest_DockerImage(t *testing.T) {
 		},
 	}
 
-	target, err := FromManifest(manifest, t.TempDir())
+	target, err := FromManifest(manifest, t.TempDir(), "")
 	if err != nil {
 		t.Fatalf("expected no error, got: %v", err)
 	}
@@ -33,7 +33,7 @@ func TestFromManifest_HelmChart(t *testing.T) {
 		},
 	}
 
-	target, err := FromManifest(manifest, t.TempDir())
+	target, err := FromManifest(manifest, t.TempDir(), "myrepo/mychart:1.0.0")
 	if err != nil {
 		t.Fatalf("expected no error, got: %v", err)
 	}
@@ -49,7 +49,7 @@ func TestFromManifest_File(t *testing.T) {
 		},
 	}
 
-	target, err := FromManifest(manifest, t.TempDir())
+	target, err := FromManifest(manifest, t.TempDir(), "")
 	if err != nil {
 		t.Fatalf("expected no error, got: %v", err)
 	}
@@ -76,7 +76,7 @@ func TestFromManifest_OciImageConfigWithTitleAnnotation(t *testing.T) {
 		},
 	}
 
-	target, err := FromManifest(manifest, t.TempDir())
+	target, err := FromManifest(manifest, t.TempDir(), "")
 	if err != nil {
 		t.Fatalf("expected no error, got: %v", err)
 	}
@@ -107,7 +107,7 @@ func TestFromManifest_EmptyConfigFile(t *testing.T) {
 		},
 	}
 
-	target, err := FromManifest(manifest, t.TempDir())
+	target, err := FromManifest(manifest, t.TempDir(), "")
 	if err != nil {
 		t.Fatalf("expected no error, got: %v", err)
 	}
@@ -137,7 +137,7 @@ func TestFromManifest_FileLayerFallback(t *testing.T) {
 		},
 	}
 
-	target, err := FromManifest(manifest, t.TempDir())
+	target, err := FromManifest(manifest, t.TempDir(), "")
 	if err != nil {
 		t.Fatalf("expected no error, got: %v", err)
 	}
@@ -171,7 +171,7 @@ func TestFromManifest_UnknownNoTitle(t *testing.T) {
 		},
 	}
 
-	target, err := FromManifest(manifest, t.TempDir())
+	target, err := FromManifest(manifest, t.TempDir(), "")
 	if err != nil {
 		t.Fatalf("expected no error, got: %v", err)
 	}
@@ -286,7 +286,7 @@ func TestImages_ConfigMapperFn(t *testing.T) {
 }
 
 func TestChart_MapperFn_WithTitle(t *testing.T) {
-	mappers := Chart()
+	mappers := Chart("myrepo/mychart:1.0.0")
 
 	fn, ok := mappers[consts.ChartLayerMediaType]
 	if !ok {
@@ -304,13 +304,17 @@ func TestChart_MapperFn_WithTitle(t *testing.T) {
 		t.Fatalf("expected no error, got: %v", err)
 	}
 
+	// A title annotation always wins over a ref-derived name, even when a ref
+	// is available.
 	if result != "mychart-1.0.0.tgz" {
 		t.Fatalf("expected %q, got %q", "mychart-1.0.0.tgz", result)
 	}
 }
 
 func TestChart_MapperFn_NoTitle(t *testing.T) {
-	mappers := Chart()
+	// An empty ref (the last-resort case: no title annotation and nothing to
+	// derive a name from) must still fall back to the literal "chart.tar.gz".
+	mappers := Chart("")
 
 	fn, ok := mappers[consts.ChartLayerMediaType]
 	if !ok {
@@ -326,6 +330,32 @@ func TestChart_MapperFn_NoTitle(t *testing.T) {
 
 	if result != "chart.tar.gz" {
 		t.Fatalf("expected %q, got %q", "chart.tar.gz", result)
+	}
+}
+
+// TestChart_MapperFn_NoTitle_DerivesFromRef pins Part 2 of the OCI-passthrough
+// change: upstream OCI Helm charts never carry an
+// org.opencontainers.image.title layer annotation (that's hauler's own
+// invention from the rewrap path), so without a ref-derived fallback every
+// passthrough chart extracted via `store copy dir://` would collide on the
+// literal "chart.tar.gz".
+func TestChart_MapperFn_NoTitle_DerivesFromRef(t *testing.T) {
+	mappers := Chart("nginxinc/charts/nginx-ingress:2.0.0")
+
+	fn, ok := mappers[consts.ChartLayerMediaType]
+	if !ok {
+		t.Fatalf("expected mapper for %s", consts.ChartLayerMediaType)
+	}
+
+	desc := ocispec.Descriptor{}
+
+	result, err := fn(desc)
+	if err != nil {
+		t.Fatalf("expected no error, got: %v", err)
+	}
+
+	if result != "nginx-ingress-2.0.0.tgz" {
+		t.Fatalf("expected %q, got %q", "nginx-ingress-2.0.0.tgz", result)
 	}
 }
 

@@ -24,6 +24,7 @@ import (
 	"helm.sh/helm/v4/pkg/chart/v2/loader"
 	"helm.sh/helm/v4/pkg/chart/v2/util"
 	"helm.sh/helm/v4/pkg/engine"
+	"helm.sh/helm/v4/pkg/registry"
 	"k8s.io/apimachinery/pkg/util/yaml"
 
 	"hauler.dev/go/hauler/v2/internal/flags"
@@ -1152,25 +1153,71 @@ func fetchChart(ctx context.Context, s *store.Layout, j chartJob, tempRoot strin
 		return nil, nil, err
 	}
 
-	var chartDesc ocispec.Descriptor
-	err = retry.Operation(ctx, rso, ro, func() error {
-		var addErr error
-		chartDesc, addErr = s.AddArtifact(ctx, chrt, ref.Name())
-		return addErr
-	})
-	if err != nil {
-		if ignoreErrors {
-			log.BaseFromContext(ctx).Warnf("unable to add chart [%s] to store: %v... skipping...", ref.Name(), err)
-			return nil, nil, nil
-		} else if errors.Is(err, context.Canceled) {
-			// Under traverseChartLevels' fail-fast errgroup, one real failure
-			// cancels every other in-flight chart's context -- see
-			// storeImage's identical branch for the full rationale.
-			log.BaseFromContext(ctx).Debugf("unable to add chart [%s] to store: %v", ref.Name(), err)
+	// For a chart sourced from a real OCI Helm repository, store the
+	// publisher's own manifest byte-for-byte via the same image-fetch path
+	// `store add image` uses, instead of rebuilding one around the downloaded
+	// chart bytes (which discards the publisher's manifest-level annotations
+	// -- authors, created, description, source, title, url, version -- and
+	// changes the digest, breaking cosign verification against the
+	// publisher's signature). Reconstructs the exact ref Helm resolved:
+	// j.cfg.Name is the same name chart.NewChart used to build its own
+	// chartRef, and c.Metadata.Version is Helm's *resolved* version (Version
+	// may have been "" going in, meaning "latest").
+	//
+	// A failure here is deliberately never fatal: it falls through to the
+	// rewrap path below rather than failing the whole chart add, since
+	// availability of the chart outweighs preserving upstream provenance.
+	// Only a cancelled context propagates, matching every other cancellation
+	// branch in this function.
+	var chartDigest string
+	if registry.IsOCI(j.opts.ChartOpts.RepoURL) {
+		ociRepo := strings.TrimSuffix(strings.TrimPrefix(j.opts.ChartOpts.RepoURL, "oci://"), "/")
+		ociRefStr := ociRepo + "/" + j.cfg.Name + ":" + c.Metadata.Version
+
+		ociRef, parseErr := name.ParseReference(ociRefStr)
+		if parseErr != nil {
+			log.BaseFromContext(ctx).Warnf("unable to parse OCI chart reference [%s], storing chart [%s] without upstream provenance: %v", ociRefStr, displayName, parseErr)
+		} else {
+			addErr := retry.Operation(ctx, rso, ro, func() error {
+				var digErr error
+				chartDigest, digErr = s.AddImage(ctx, ociRefStr, "", false, "")
+				return digErr
+			})
+			switch {
+			case addErr == nil:
+				ref = ociRef
+			case errors.Is(addErr, context.Canceled):
+				log.BaseFromContext(ctx).Debugf("unable to add chart [%s] to store: %v", ociRefStr, addErr)
+				return nil, nil, addErr
+			default:
+				log.BaseFromContext(ctx).Warnf("unable to store chart [%s] as an OCI artifact, storing without upstream provenance: %v", ociRefStr, addErr)
+				chartDigest = ""
+			}
+		}
+	}
+
+	if chartDigest == "" {
+		var chartDesc ocispec.Descriptor
+		err = retry.Operation(ctx, rso, ro, func() error {
+			var addErr error
+			chartDesc, addErr = s.AddArtifact(ctx, chrt, ref.Name())
+			return addErr
+		})
+		if err != nil {
+			if ignoreErrors {
+				log.BaseFromContext(ctx).Warnf("unable to add chart [%s] to store: %v... skipping...", ref.Name(), err)
+				return nil, nil, nil
+			} else if errors.Is(err, context.Canceled) {
+				// Under traverseChartLevels' fail-fast errgroup, one real failure
+				// cancels every other in-flight chart's context -- see
+				// storeImage's identical branch for the full rationale.
+				log.BaseFromContext(ctx).Debugf("unable to add chart [%s] to store: %v", ref.Name(), err)
+				return nil, nil, err
+			}
+			log.BaseFromContext(ctx).Errorf("unable to add chart [%s] to store: %v", ref.Name(), err)
 			return nil, nil, err
 		}
-		log.BaseFromContext(ctx).Errorf("unable to add chart [%s] to store: %v", ref.Name(), err)
-		return nil, nil, err
+		chartDigest = chartDesc.Digest.String()
 	}
 
 	if j.rewrite != "" {
@@ -1186,8 +1233,8 @@ func fetchChart(ctx context.Context, s *store.Layout, j chartJob, tempRoot strin
 			Type:      "chart",
 			Command:   "store add chart",
 			Args:      []string{c.Name()},
-			Reference: c.Name() + ":" + c.Metadata.Version,
-			Digest:    chartDesc.Digest.String(),
+			Reference: ref.Name(),
+			Digest:    chartDigest,
 		}
 		if auditLevel(ro) == "verbose" {
 			sys := audit.BuildSystem()
