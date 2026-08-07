@@ -64,8 +64,10 @@ func createRootLevelArchive(dir, outfile string) error {
 // --------------------------------------------------------------------------
 
 // TestUnarchiveLayoutTo verifies that unarchiveLayoutTo correctly extracts a
-// haul archive into a destination OCI layout, backfills missing annotations,
-// and propagates the ContainerdImageNameKey → ImageRefKey mapping.
+// haul archive into a destination OCI layout and that every loaded descriptor
+// converges to the kind-free shape content.OCI.loadIndexLocked's migration
+// produces -- whether the archive was already kind-free or needed migrating,
+// no "kind" annotation survives into the loaded store.
 func TestUnarchiveLayoutTo(t *testing.T) {
 	ctx := newTestContext(t)
 	destDir := t.TempDir()
@@ -84,18 +86,14 @@ func TestUnarchiveLayoutTo(t *testing.T) {
 		t.Fatal("expected at least one descriptor in dest store after unarchiveLayoutTo")
 	}
 
-	// Every top-level descriptor must carry KindAnnotationName.
-	// Descriptors that were loaded with ContainerdImageNameKey must also have
-	// ImageRefKey set (the backfill logic in unarchiveLayoutTo ensures this).
+	// Every descriptor must have a ref.name (AddIndex requires it, so this also
+	// exercises the read path end-to-end) and no "kind" annotation at all.
 	if err := s.OCI.Walk(func(_ string, desc ocispec.Descriptor) error {
-		if desc.Annotations[consts.KindAnnotationName] == "" {
-			t.Errorf("descriptor %s missing KindAnnotationName", desc.Digest)
+		if desc.Annotations[ocispec.AnnotationRefName] == "" {
+			t.Errorf("descriptor %s missing %s", desc.Digest, ocispec.AnnotationRefName)
 		}
-		if _, hasContainerd := desc.Annotations[consts.ContainerdImageNameKey]; hasContainerd {
-			if desc.Annotations[consts.ImageRefKey] == "" {
-				t.Errorf("descriptor %s has %s but missing %s",
-					desc.Digest, consts.ContainerdImageNameKey, consts.ImageRefKey)
-			}
+		if kind, ok := desc.Annotations[consts.KindAnnotationName]; ok {
+			t.Errorf("descriptor %s still has a kind annotation %q after loading", desc.Digest, kind)
 		}
 		return nil
 	}); err != nil {
@@ -274,8 +272,13 @@ func TestLoadCmd_RemoteArchive(t *testing.T) {
 // --------------------------------------------------------------------------
 
 // TestUnarchiveLayoutTo_AnnotationBackfill crafts a haul archive whose
-// index.json entries are missing KindAnnotationName, then verifies that
-// unarchiveLayoutTo backfills every entry with KindAnnotationImage.
+// index.json entries are missing KindAnnotationName -- simulating a haul
+// produced by a current hauler, which never writes one -- then
+// verifies that unarchiveLayoutTo loads every entry unchanged rather than
+// (as an older hauler version did) stamping a default kind onto it. That old
+// stamping behavior would have mislabeled every kind-free entry (charts,
+// files, sig/att/sbom/referrer artifacts, not just real images) as a plain
+// image before content.OCI.loadIndexLocked's migration logic ever ran.
 func TestUnarchiveLayoutTo_AnnotationBackfill(t *testing.T) {
 	ctx := newTestContext(t)
 
@@ -325,20 +328,26 @@ func TestUnarchiveLayoutTo_AnnotationBackfill(t *testing.T) {
 		t.Fatalf("unarchiveLayoutTo stripped: %v", err)
 	}
 
-	// Step 5: Every descriptor in the dest store must now have
-	// KindAnnotationName set to KindAnnotationImage (the backfill default).
+	// Step 5: Every descriptor in the dest store must remain kind-free -- no
+	// value stamped onto it -- and its ref.name must be exactly what the
+	// stripped archive already had (untouched, since the migration treats a
+	// kind-free entry as already-correct, not something to migrate).
 	s, err := store.NewLayout(destDir)
 	if err != nil {
 		t.Fatalf("store.NewLayout(destDir): %v", err)
 	}
 
+	origRefs := make(map[string]bool, len(idx.Manifests))
+	for _, d := range idx.Manifests {
+		origRefs[d.Annotations[ocispec.AnnotationRefName]] = true
+	}
+
 	if err := s.OCI.Walk(func(_ string, desc ocispec.Descriptor) error {
-		kind := desc.Annotations[consts.KindAnnotationName]
-		if kind == "" {
-			t.Errorf("descriptor %s missing KindAnnotationName after backfill", desc.Digest)
-		} else if kind != consts.KindAnnotationImage {
-			t.Errorf("descriptor %s: expected backfilled kind=%q, got %q",
-				desc.Digest, consts.KindAnnotationImage, kind)
+		if kind, ok := desc.Annotations[consts.KindAnnotationName]; ok {
+			t.Errorf("descriptor %s: expected no kind annotation, got %q", desc.Digest, kind)
+		}
+		if ref := desc.Annotations[ocispec.AnnotationRefName]; !origRefs[ref] {
+			t.Errorf("descriptor %s: ref.name %q was not one of the original stripped-archive refs -- it was rewritten", desc.Digest, ref)
 		}
 		return nil
 	}); err != nil {
@@ -352,7 +361,10 @@ func TestUnarchiveLayoutTo_AnnotationBackfill(t *testing.T) {
 
 // TestUnarchiveLayoutTo_LegacyKindMigration crafts a haul archive whose
 // index.json contains old dev.cosignproject.cosign kind values, then verifies
-// that unarchiveLayoutTo translates them to dev.hauler equivalents.
+// that unarchiveLayoutTo's migration (content.OCI.loadIndexLocked) still
+// recognizes them via consts.NormalizeLegacyKind internally, and converges the
+// loaded store to the fully kind-free shape rather than merely translating
+// the prefix.
 func TestUnarchiveLayoutTo_LegacyKindMigration(t *testing.T) {
 	ctx := newTestContext(t)
 
@@ -417,21 +429,18 @@ func TestUnarchiveLayoutTo_LegacyKindMigration(t *testing.T) {
 		t.Fatalf("unarchiveLayoutTo legacy: %v", err)
 	}
 
-	// Step 5: Every descriptor in the dest store must now have a dev.hauler kind.
+	// Step 5: Every descriptor in the dest store must now be kind-free -- the
+	// legacy dev.cosignproject.cosign values must not survive in any form,
+	// translated or otherwise (loading drops "kind" entirely, for every entry,
+	// once NormalizeLegacyKind has done its internal recognition work).
 	s, err := store.NewLayout(destDir)
 	if err != nil {
 		t.Fatalf("store.NewLayout(destDir): %v", err)
 	}
 
 	if err := s.OCI.Walk(func(_ string, desc ocispec.Descriptor) error {
-		kind := desc.Annotations[consts.KindAnnotationName]
-		if strings.HasPrefix(kind, legacyPrefix) {
-			t.Errorf("descriptor %s still has legacy kind %q... expected dev.hauler prefix",
-				desc.Digest, kind)
-		}
-		if !strings.HasPrefix(kind, newPrefix) {
-			t.Errorf("descriptor %s has unexpected kind %q... expected dev.hauler prefix",
-				desc.Digest, kind)
+		if kind, ok := desc.Annotations[consts.KindAnnotationName]; ok {
+			t.Errorf("descriptor %s: expected no kind annotation after legacy migration, got %q", desc.Digest, kind)
 		}
 		return nil
 	}); err != nil {

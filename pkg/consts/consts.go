@@ -41,17 +41,35 @@ const (
 	HaulerVendorPrefix = "vnd.hauler"
 
 	// annotation keys
+	//
+	// ContainerdImageNameKey ("io.containerd.image.name") holds a full ref with
+	// registry. On a real image/index descriptor it is that descriptor's own name
+	// (registry-prepended). On a sig/att/sbom/referrer descriptor it is instead a
+	// deliberate subject pointer: the *base* image's full ref, not the artifact's
+	// own ref -- which now lives, uniquely, in org.opencontainers.image.ref.name.
+	// This is not a compatibility wart; it is what lets `store info`/`store remove`
+	// group a signature under its image without decoding the manifest's `subject`
+	// field, and it is exactly the invariant content.saveIndexLocked's sort relies
+	// on (registry-stripped ContainerdImageNameKey == ref.name iff the descriptor
+	// is a real image/index).
 	ContainerdImageNameKey = "io.containerd.image.name"
-	KindAnnotationName     = "kind"
-	KindAnnotationImage    = "dev.hauler/image"
-	KindAnnotationIndex    = "dev.hauler/imageIndex"
-	KindAnnotationSigs     = "dev.hauler/sigs"
-	KindAnnotationAtts     = "dev.hauler/atts"
-	KindAnnotationSboms    = "dev.hauler/sboms"
-	// KindAnnotationReferrers is the kind prefix for OCI 1.1 referrer manifests (cosign v3
-	// new-bundle-format). Each referrer gets a unique kind with the referrer manifest digest
-	// appended (e.g. "dev.hauler/referrers/sha256hex") so multiple referrers for the same
-	// base image coexist in the OCI index.
+	// KindAnnotationName and the KindAnnotation* values below are read-only
+	// legacy: new stores no longer write a "kind" annotation at all -- content
+	// type is derived from manifest bytes at read time (see pkg/artifacts.Classify).
+	// They are retained solely so loadIndexLocked can recognize and migrate an
+	// old-format index.json's entries on load; consts.NormalizeLegacyKind
+	// translates the even-older dev.cosignproject.cosign/... values first.
+	KindAnnotationName  = "kind"
+	KindAnnotationImage = "dev.hauler/image"
+	KindAnnotationIndex = "dev.hauler/imageIndex"
+	KindAnnotationSigs  = "dev.hauler/sigs"
+	KindAnnotationAtts  = "dev.hauler/atts"
+	KindAnnotationSboms = "dev.hauler/sboms"
+	// KindAnnotationReferrers was the kind prefix for OCI 1.1 referrer manifests
+	// (cosign v3 new-bundle-format) in a legacy store: each referrer's kind had
+	// the referrer manifest digest appended (e.g. "dev.hauler/referrers/sha256hex")
+	// since the digest was the only thing disambiguating multiple referrers that
+	// otherwise all shared the base image's ref.name.
 	KindAnnotationReferrers = "dev.hauler/referrers"
 
 	// Sigstore / OCI 1.1 artifact media types used by cosign v3 new-bundle-format.
@@ -63,6 +81,17 @@ const (
 	AnnotationRetries     = "hauler.dev/retries"
 
 	// annotations used by images
+	// Cosign v3's "experimental OCI 1.1" referrer artifactType convention --
+	// github.com/sigstore/cosign/v3/internal/pkg/oci/remote.ArtifactType computes
+	// these as fmt.Sprintf("application/vnd.dev.cosign.artifact.%s.v1+json", attName)
+	// for "sig"/"att"/"sbom"; that helper is unexported, so the three results are
+	// hardcoded here. WriteSignaturesExperimentalOCI (pkg/oci/remote/write.go) sets
+	// the sig value as a referrer manifest's artifactType; `cosign attach sbom`
+	// (cmd/cosign/cli/attach/sbom.go) sets the sbom value the same way.
+	CosignReferrerSigArtifactType  = "application/vnd.dev.cosign.artifact.sig.v1+json"
+	CosignReferrerAttArtifactType  = "application/vnd.dev.cosign.artifact.att.v1+json"
+	CosignReferrerSBOMArtifactType = "application/vnd.dev.cosign.artifact.sbom.v1+json"
+
 	ImageAnnotationKey           = "hauler.dev/key"
 	ImageAnnotationPlatform      = "hauler.dev/platform"
 	ImageAnnotationRegistry      = "hauler.dev/registry"

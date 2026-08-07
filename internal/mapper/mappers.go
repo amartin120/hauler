@@ -5,43 +5,27 @@ import (
 
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 
+	"hauler.dev/go/hauler/v2/pkg/artifacts"
 	"hauler.dev/go/hauler/v2/pkg/consts"
 	"hauler.dev/go/hauler/v2/pkg/content"
 )
 
 type Fn func(desc ocispec.Descriptor) (string, error)
 
-// FromManifest will return the appropriate content store given a reference and source type adequate for storing the results on disk
+// FromManifest returns the appropriate content store for extracting manifest's
+// layers to disk, routed by artifacts.Classify's content-derived Kind rather
+// than by which subcommand originally wrote the manifest.
 func FromManifest(manifest ocispec.Manifest, root string) (content.Target, error) {
-	// First, switch on config mediatype to identify known types.
-	switch manifest.Config.MediaType {
-	case consts.ChartLayerMediaType, consts.ChartConfigMediaType:
+	switch artifacts.Classify(ocispec.Descriptor{MediaType: string(manifest.MediaType)}, &manifest) {
+	case artifacts.KindChart:
 		return NewMapperFileStore(root, Chart())
-
-	case consts.FileLocalConfigMediaType, consts.FileDirectoryConfigMediaType, consts.FileHttpConfigMediaType:
+	case artifacts.KindFile:
 		return NewMapperFileStore(root, Files())
-
-	case consts.DockerConfigJSON, ocispec.MediaTypeImageConfig:
-		// Standard OCI/Docker image config. OCI artifacts that distribute files
-		// (e.g. rke2-binary) reuse this config type but set AnnotationTitle on their
-		// layers. When title annotations are present prefer Files() so the title is
-		// used as the output filename; otherwise treat as a container image.
-		for _, layer := range manifest.Layers {
-			if _, ok := layer.Annotations[ocispec.AnnotationTitle]; ok {
-				return NewMapperFileStore(root, Files())
-			}
-		}
+	case artifacts.KindImage:
 		return NewMapperFileStore(root, Images())
+	default:
+		return NewMapperFileStore(root, Default())
 	}
-
-	// Unknown config type: title annotation indicates a file artifact; otherwise use
-	// a catch-all mapper that writes blobs by digest.
-	for _, layer := range manifest.Layers {
-		if _, ok := layer.Annotations[ocispec.AnnotationTitle]; ok {
-			return NewMapperFileStore(root, Files())
-		}
-	}
-	return NewMapperFileStore(root, Default())
 }
 
 func Images() map[string]Fn {

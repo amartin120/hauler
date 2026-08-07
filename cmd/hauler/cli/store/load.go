@@ -2,7 +2,6 @@ package store
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"net/url"
@@ -20,8 +19,6 @@ import (
 	"hauler.dev/go/hauler/v2/pkg/getter"
 	"hauler.dev/go/hauler/v2/pkg/log"
 	"hauler.dev/go/hauler/v2/pkg/store"
-
-	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 )
 
 // matches the old <base>_NNN.<ext> chunk naming of haul_0.tar.zst
@@ -210,45 +207,15 @@ func unarchiveLayoutTo(ctx context.Context, haulPath string, dest string, tempDi
 		return err
 	}
 
-	// ensure the incoming index.json has the correct annotations.
-	data, err := os.ReadFile(tempDir + "/index.json")
-	if err != nil {
-		return (err)
-	}
-
-	var idx ocispec.Index
-	if err := json.Unmarshal(data, &idx); err != nil {
-		return (err)
-	}
-
-	for i := range idx.Manifests {
-		if idx.Manifests[i].Annotations == nil {
-			idx.Manifests[i].Annotations = make(map[string]string)
-		}
-		if _, exists := idx.Manifests[i].Annotations[consts.KindAnnotationName]; !exists {
-			idx.Manifests[i].Annotations[consts.KindAnnotationName] = consts.KindAnnotationImage
-		}
-		// Translate legacy dev.cosignproject.cosign values to dev.hauler equivalents.
-		kind := idx.Manifests[i].Annotations[consts.KindAnnotationName]
-		idx.Manifests[i].Annotations[consts.KindAnnotationName] = consts.NormalizeLegacyKind(kind)
-		if ref, ok := idx.Manifests[i].Annotations[consts.ContainerdImageNameKey]; ok {
-			if slash := strings.Index(ref, "/"); slash != -1 {
-				ref = ref[slash+1:]
-			}
-			if idx.Manifests[i].Annotations[consts.ImageRefKey] != ref {
-				idx.Manifests[i].Annotations[consts.ImageRefKey] = ref
-			}
-		}
-	}
-
-	out, err := json.MarshalIndent(idx, "", "  ")
-	if err != nil {
-		return err
-	}
-	if err := os.WriteFile(tempDir+"/index.json", out, 0644); err != nil {
-		return err
-	}
-
+	// content.OCI.loadIndexLocked (invoked by store.NewLayout below) is the single
+	// place that interprets an extracted index.json: it normalizes legacy
+	// dev.cosignproject.cosign/... kind values and migrates sig/att/sbom/referrer
+	// entries written under that old kind-annotation scheme to their own true
+	// ref. Pre-stamping a default kind here (as this used to do) would mislabel
+	// every kind-free entry a current-format archive already writes -- charts,
+	// files, and every sig/att/sbom/referrer alike -- as a plain image before
+	// that migration ever runs, defeating its "no kind annotation means
+	// already-correct" assumption.
 	s, err := store.NewLayout(tempDir)
 	if err != nil {
 		return err

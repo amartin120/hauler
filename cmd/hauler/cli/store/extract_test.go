@@ -15,8 +15,10 @@ import (
 	"github.com/google/go-containerregistry/pkg/v1/remote"
 	"github.com/google/go-containerregistry/pkg/v1/static"
 	gvtypes "github.com/google/go-containerregistry/pkg/v1/types"
+	digest "github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/rs/zerolog"
+	ctypes "github.com/sigstore/cosign/v3/pkg/types"
 
 	"hauler.dev/go/hauler/v2/internal/flags"
 	v1 "hauler.dev/go/hauler/v2/pkg/apis/hauler.cattle.io/v1"
@@ -567,12 +569,18 @@ func newLogCaptureContext(buf *bytes.Buffer) context.Context {
 
 func TestExtractCmd_CosignArtifactsProduceNoContainerImageWarning(t *testing.T) {
 	// Regression test: extracting a file ref whose store also contains cosign
-	// sig/att/sbom/referrer descriptors with the same repo prefix must not emit
-	// the "container images cannot be extracted" warning for those cosign descriptors.
+	// sig/att/sbom/referrer descriptors pointing at it must not emit the
+	// "container images cannot be extracted" warning for those cosign
+	// descriptors, and a direct query for one of their own true refs must skip
+	// it silently (debug level) rather than warn or fail as an unextractable
+	// container image.
 	//
-	// Before the fix, cosign manifests tripped isContainerImageManifest() and caused
-	// a misleading WRN line. The fix is a kind-annotation early-return in the Walk
-	// callback that mirrors the pattern in copy.go:49-58.
+	// Before the fix, cosign manifests tripped isContainerImageManifest() and
+	// caused a misleading WRN line. Now each artifact's own ref.name is its
+	// true, unique value (e.g. repo:sha256-<hex>.sig, repo@sha256:<hex> for a
+	// referrer) -- disjoint from the base file's own ref -- so this also proves
+	// artifacts.Classify's cosign rules (2/3) still short-circuit before the
+	// image/file rules (5/6) reject them for the wrong reason.
 
 	var logBuf bytes.Buffer
 	ctx := newLogCaptureContext(&logBuf)
@@ -585,21 +593,43 @@ func TestExtractCmd_CosignArtifactsProduceNoContainerImageWarning(t *testing.T) 
 		t.Fatalf("storeFile: %v", err)
 	}
 
-	// The file is stored under "hauler/sigtest.txt:latest". Inject fake cosign
-	// sig/att/sbom/referrer descriptors sharing the same AnnotationRefName so the
-	// Walk callback's strings.Contains(reference, repo) filter matches them too.
+	// The file is stored under "hauler/sigtest.txt:latest". Seed real,
+	// content-shaped cosign v2 tag-convention sig/att/sbom manifests and an OCI
+	// 1.1 referrer, each with its own true ref, pointing back at the file via
+	// the subject-pointer annotation.
 	baseRef := "hauler/sigtest.txt:latest"
-	for _, kind := range []string{
-		consts.KindAnnotationSigs,
-		consts.KindAnnotationAtts,
-		consts.KindAnnotationSboms,
-		consts.KindAnnotationReferrers + "/sha256" + strings.Repeat("a", 64),
-	} {
-		seedStoreDescriptor(t, s, map[string]string{
-			ocispec.AnnotationRefName:     baseRef,
-			consts.KindAnnotationName:     kind,
-			consts.ContainerdImageNameKey: "registry.example.com/" + baseRef,
-		})
+	subjectAnnotations := map[string]string{consts.ContainerdImageNameKey: "registry.example.com/" + baseRef}
+
+	digestHex := strings.Repeat("a", 64)
+	sigRef := "hauler/sigtest.txt:sha256-" + digestHex + ".sig"
+	seedManifestDescriptor(t, s, ocispec.Manifest{
+		MediaType: ocispec.MediaTypeImageManifest,
+		Config:    ocispec.Descriptor{MediaType: consts.DockerConfigJSON},
+		Layers:    []ocispec.Descriptor{{MediaType: ctypes.SimpleSigningMediaType}},
+	}, mergeAnnotations(subjectAnnotations, map[string]string{ocispec.AnnotationRefName: sigRef}))
+
+	attRef := "hauler/sigtest.txt:sha256-" + digestHex + ".att"
+	seedManifestDescriptor(t, s, ocispec.Manifest{
+		MediaType: ocispec.MediaTypeImageManifest,
+		Config:    ocispec.Descriptor{MediaType: consts.DockerConfigJSON},
+		Layers:    []ocispec.Descriptor{{MediaType: ctypes.DssePayloadType}},
+	}, mergeAnnotations(subjectAnnotations, map[string]string{ocispec.AnnotationRefName: attRef}))
+
+	sbomRef := "hauler/sigtest.txt:sha256-" + digestHex + ".sbom"
+	seedManifestDescriptor(t, s, ocispec.Manifest{
+		MediaType: ocispec.MediaTypeImageManifest,
+		Config:    ocispec.Descriptor{MediaType: consts.DockerConfigJSON},
+		Layers:    []ocispec.Descriptor{{MediaType: ctypes.SPDXJSONMediaType}},
+	}, mergeAnnotations(subjectAnnotations, map[string]string{ocispec.AnnotationRefName: sbomRef}))
+
+	referrerRef := "hauler/sigtest.txt@sha256:" + digestHex
+	referrerDesc := seedManifestDescriptor(t, s, ocispec.Manifest{
+		MediaType:    ocispec.MediaTypeImageManifest,
+		ArtifactType: consts.CosignReferrerSigArtifactType,
+		Subject:      &ocispec.Descriptor{MediaType: ocispec.MediaTypeImageManifest, Digest: digest.Digest("sha256:" + strings.Repeat("b", 64))},
+	}, mergeAnnotations(subjectAnnotations, map[string]string{ocispec.AnnotationRefName: referrerRef}))
+	if referrerDesc.Digest == "" {
+		t.Fatal("seedManifestDescriptor: empty digest for referrer fixture")
 	}
 
 	destDir := t.TempDir()
@@ -626,5 +656,18 @@ func TestExtractCmd_CosignArtifactsProduceNoContainerImageWarning(t *testing.T) 
 	}
 	if string(data) != fileContent {
 		t.Errorf("content mismatch: got %q, want %q", string(data), fileContent)
+	}
+
+	// A direct query for the sig's own true ref must skip it (debug level) and
+	// report "not found", since `found` is never set for a skipped cosign
+	// artifact -- it must not warn, and must not succeed as if it extracted
+	// something.
+	logBuf.Reset()
+	err = ExtractCmd(ctx, eo, s, sigRef)
+	if err == nil || !strings.Contains(err.Error(), "not found") {
+		t.Fatalf("ExtractCmd(sigRef) = %v, want a \"not found\" error", err)
+	}
+	if strings.Contains(logBuf.String(), "container images cannot be extracted") {
+		t.Errorf("unexpected warning in log output querying the sig directly:\n%s", logBuf.String())
 	}
 }

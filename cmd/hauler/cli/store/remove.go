@@ -13,6 +13,7 @@ import (
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 
 	"hauler.dev/go/hauler/v2/internal/flags"
+	"hauler.dev/go/hauler/v2/pkg/artifacts"
 	"hauler.dev/go/hauler/v2/pkg/audit"
 	"hauler.dev/go/hauler/v2/pkg/consts"
 	"hauler.dev/go/hauler/v2/pkg/log"
@@ -20,41 +21,25 @@ import (
 )
 
 // artifactType derives a human-readable content type for an artifact the same way `store info`
-// does: from the manifest's config media type, since AddArtifact stores every non-image-command
-// artifact (files, charts) under the same "kind" annotation and can't distinguish them
+// does: from the manifest's own content via artifacts.Classify, decoding the manifest blob
+// (except for an index, which classifies from desc.MediaType alone).
 func artifactType(ctx context.Context, s *store.Layout, desc ocispec.Descriptor) string {
-	switch {
-	case desc.Annotations[consts.KindAnnotationName] == consts.KindAnnotationSigs:
-		return "sigs"
-	case desc.Annotations[consts.KindAnnotationName] == consts.KindAnnotationAtts:
-		return "atts"
-	case desc.Annotations[consts.KindAnnotationName] == consts.KindAnnotationSboms:
-		return "sbom"
-	case strings.HasPrefix(desc.Annotations[consts.KindAnnotationName], consts.KindAnnotationReferrers):
-		return "referrer"
-	case desc.MediaType == consts.OCIImageIndexSchema, desc.MediaType == consts.DockerManifestListSchema2:
-		return "image"
+	if desc.MediaType == consts.OCIImageIndexSchema || desc.MediaType == consts.DockerManifestListSchema2 {
+		return displayType(artifacts.KindIndex)
 	}
 
 	rc, err := s.Fetch(ctx, desc)
 	if err != nil {
-		return "image"
+		return displayType(artifacts.KindUnknown)
 	}
 	defer rc.Close()
 
 	var m ocispec.Manifest
 	if err := json.NewDecoder(rc).Decode(&m); err != nil {
-		return "image"
+		return displayType(artifacts.KindUnknown)
 	}
 
-	switch m.Config.MediaType {
-	case consts.ChartConfigMediaType:
-		return "chart"
-	case consts.FileLocalConfigMediaType, consts.FileHttpConfigMediaType, consts.FileDirectoryConfigMediaType:
-		return "file"
-	default:
-		return "image"
-	}
+	return displayType(artifacts.Classify(desc, &m))
 }
 
 func formatReference(ref string) string {

@@ -13,6 +13,7 @@ import (
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 
 	"hauler.dev/go/hauler/v2/internal/flags"
+	"hauler.dev/go/hauler/v2/pkg/artifacts"
 	"hauler.dev/go/hauler/v2/pkg/consts"
 	"hauler.dev/go/hauler/v2/pkg/log"
 	"hauler.dev/go/hauler/v2/pkg/reference"
@@ -106,12 +107,12 @@ func InfoCmd(ctx context.Context, o *flags.InfoOpts, s *store.Layout) error {
 					continue
 				}
 
-				ctype := resolveCtype(desc, internalManifest.Config.MediaType)
+				ctype := displayType(artifacts.Classify(internalDesc, &internalManifest))
 				if o.TypeFilter != "all" && ctype != o.TypeFilter {
 					continue
 				}
 
-				i := newItemWithDigest(s, internalDesc.Digest.String(), desc, internalManifest, plat, o)
+				i := newItemWithDigest(internalDesc.Digest.String(), desc, internalManifest, plat, o, ctype)
 				if i.isEmpty() {
 					continue
 				}
@@ -149,7 +150,7 @@ func InfoCmd(ctx context.Context, o *flags.InfoOpts, s *store.Layout) error {
 				return nil
 			}
 
-			ctype := resolveCtype(desc, m.Config.MediaType)
+			ctype := displayType(artifacts.Classify(desc, &m))
 			if o.TypeFilter != "all" && ctype != o.TypeFilter {
 				return nil
 			}
@@ -193,7 +194,7 @@ func InfoCmd(ctx context.Context, o *flags.InfoOpts, s *store.Layout) error {
 				plat = fmt.Sprintf("%s/%s", internalManifest.OS, internalManifest.Architecture)
 			}
 
-			i := newItem(s, desc, m, plat, o)
+			i := newItem(desc, m, plat, o, ctype)
 			if i.isEmpty() {
 				return nil
 			}
@@ -230,12 +231,12 @@ func InfoCmd(ctx context.Context, o *flags.InfoOpts, s *store.Layout) error {
 				return nil
 			}
 
-			ctype := resolveCtype(desc, m.Config.MediaType)
+			ctype := displayType(artifacts.Classify(desc, &m))
 			if o.TypeFilter != "all" && ctype != o.TypeFilter {
 				return nil
 			}
 
-			i := newItem(s, desc, m, "-", o)
+			i := newItem(desc, m, "-", o, ctype)
 			if i.isEmpty() {
 				return nil
 			}
@@ -556,19 +557,23 @@ func (a byReferenceAndArch) Less(i, j int) bool {
 }
 
 // overrides the digest with a specific per platform digest
-func newItemWithDigest(s *store.Layout, digestStr string, desc ocispec.Descriptor, m ocispec.Manifest, plat string, o *flags.InfoOpts) item {
-	item := newItem(s, desc, m, plat, o)
+func newItemWithDigest(digestStr string, desc ocispec.Descriptor, m ocispec.Manifest, plat string, o *flags.InfoOpts, ctype string) item {
+	item := newItem(desc, m, plat, o, ctype)
 	item.Digest = digestStr
 	return item
 }
 
-func newItem(s *store.Layout, desc ocispec.Descriptor, m ocispec.Manifest, plat string, o *flags.InfoOpts) item {
+// newItem builds a display row from desc/m. ctype is precomputed by the caller
+// (via displayType(artifacts.Classify(...))) rather than derived here, since for
+// an image index's child platform manifest the correct classification input is
+// the *child's* own descriptor/manifest, while desc/m here stay the index's own
+// entry (Reference and Digest must show the index's tag, common to every
+// platform row under it, not the child's).
+func newItem(desc ocispec.Descriptor, m ocispec.Manifest, plat string, o *flags.InfoOpts, ctype string) item {
 	var size int64 = 0
 	for _, l := range m.Layers {
 		size += l.Size
 	}
-
-	ctype := resolveCtype(desc, m.Config.MediaType)
 
 	refName := desc.Annotations[consts.ContainerdImageNameKey]
 	if refName == "" {
@@ -593,34 +598,30 @@ func newItem(s *store.Layout, desc ocispec.Descriptor, m ocispec.Manifest, plat 
 	}
 }
 
-// resolveCtype computes the human-readable content type ("image", "chart", "file",
-// "sigs", "atts", "sbom", "referrer") for a descriptor. configMediaType is the
-// manifest's config media type and is used to distinguish image/chart/file when the
-// kind annotation doesn't already identify a more specific type; it may be empty
-// when the manifest could not be decoded (the --check fallback-row path), in which
-// case ctype defaults to "image" unless the kind annotation says otherwise.
-func resolveCtype(desc ocispec.Descriptor, configMediaType string) string {
-	var ctype string
-	switch configMediaType {
-	case consts.ChartConfigMediaType:
-		ctype = "chart"
-	case consts.FileLocalConfigMediaType, consts.FileHttpConfigMediaType:
-		ctype = "file"
+// displayType maps artifacts.Classify's content-derived Kind to the lowercase
+// words `store info`/`store remove` have always shown ("image", "chart",
+// "file", "sigs", "atts", "sbom", "referrer") -- so switching the
+// classification source doesn't change anyone's --type filter or JSON output.
+// KindIndex and KindUnknown both fall back to "image": an index's own row is
+// never itself displayed (its children are), and an unclassifiable manifest is
+// the same accepted best-guess default fallbackItem already made before this.
+func displayType(k artifacts.Kind) string {
+	switch k {
+	case artifacts.KindChart:
+		return "chart"
+	case artifacts.KindFile:
+		return "file"
+	case artifacts.KindSignature:
+		return "sigs"
+	case artifacts.KindAttestation:
+		return "atts"
+	case artifacts.KindSBOM:
+		return "sbom"
+	case artifacts.KindReferrer:
+		return "referrer"
 	default:
-		ctype = "image"
+		return "image"
 	}
-
-	switch {
-	case desc.Annotations[consts.KindAnnotationName] == consts.KindAnnotationSigs:
-		ctype = "sigs"
-	case desc.Annotations[consts.KindAnnotationName] == consts.KindAnnotationAtts:
-		ctype = "atts"
-	case desc.Annotations[consts.KindAnnotationName] == consts.KindAnnotationSboms:
-		ctype = "sbom"
-	case strings.HasPrefix(desc.Annotations[consts.KindAnnotationName], consts.KindAnnotationReferrers):
-		ctype = "referrer"
-	}
-	return ctype
 }
 
 // fallbackItem builds a synthetic failure row directly from desc's index
@@ -628,10 +629,10 @@ func resolveCtype(desc ocispec.Descriptor, configMediaType string) string {
 // used under --check when a manifest can't be trusted: its own digest check
 // failed, or its bytes decoded but the JSON was malformed. plat defaults to "-".
 //
-// Type is resolved with an empty configMediaType, since charts/files carry the same
-// KindAnnotationImage as regular images in the store index and so cannot be told
-// apart from an image once the manifest itself can't be decoded; this is an accepted
-// limitation, not a bug.
+// Type is resolved with no decoded manifest (Classify's m is nil), since a
+// chart/file/sig/att/sbom/referrer cannot be told apart from a real image once
+// the manifest itself can't be decoded; displayType's default of "image" for an
+// unclassifiable Kind is an accepted limitation here, not a bug.
 func fallbackItem(desc ocispec.Descriptor, plat string, problem store.BlobResult) item {
 	if plat == "" {
 		plat = "-"
@@ -648,7 +649,7 @@ func fallbackItem(desc ocispec.Descriptor, plat string, problem store.BlobResult
 
 	return item{
 		Reference:    ref.Name(),
-		Type:         resolveCtype(desc, ""),
+		Type:         displayType(artifacts.Classify(desc, nil)),
 		Platform:     plat,
 		Layers:       0,
 		Size:         0,

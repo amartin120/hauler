@@ -7,6 +7,7 @@ package store
 // Always use absolute paths for StoreDir and FileName.
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -14,9 +15,11 @@ import (
 
 	"github.com/google/go-containerregistry/pkg/name"
 	"github.com/google/go-containerregistry/pkg/v1/remote"
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 
 	"hauler.dev/go/hauler/v2/internal/flags"
 	v1 "hauler.dev/go/hauler/v2/pkg/apis/hauler.cattle.io/v1"
+	"hauler.dev/go/hauler/v2/pkg/consts"
 	"hauler.dev/go/hauler/v2/pkg/store"
 )
 
@@ -86,6 +89,90 @@ func TestLifecycle_FileArtifact_AddSaveLoadCopy(t *testing.T) {
 	// Step 6: Assert file content matches original.
 	outPath := filepath.Join(extractDir, "lifecycle.txt")
 	data, err := os.ReadFile(outPath)
+	if err != nil {
+		t.Fatalf("expected extracted file at %s: %v", outPath, err)
+	}
+	if string(data) != fileContent {
+		t.Errorf("file content mismatch: got %q, want %q", string(data), fileContent)
+	}
+}
+
+// TestLifecycle_FileArtifact_OldFormatStore_AddSaveLoadCopy is
+// TestLifecycle_FileArtifact_AddSaveLoadCopy's counterpart for an old-format
+// store: after storeFile, the file's index.json entry is rewritten in place to
+// carry the legacy "kind" annotation a pre-content-derived-identity hauler
+// binary would have written, before SaveCmd/LoadCmd/CopyCmd ever run. This
+// proves content.OCI.loadIndexLocked's migration and
+// internal/mapper.FromManifest's Classify-based routing still round-trip an
+// old-format archive's file artifact correctly end-to-end.
+func TestLifecycle_FileArtifact_OldFormatStore_AddSaveLoadCopy(t *testing.T) {
+	ctx := newTestContext(t)
+
+	fileContent := "old-format lifecycle file artifact content"
+	url := seedFileInHTTPServer(t, "old-lifecycle.txt", fileContent)
+
+	storeA := newTestStore(t)
+	if err := storeFile(ctx, storeA, v1.File{Path: url}, defaultCliOpts(), defaultRootOpts(storeA.Root)); err != nil {
+		t.Fatalf("storeFile: %v", err)
+	}
+	if err := storeA.SaveIndex(); err != nil {
+		t.Fatalf("SaveIndex: %v", err)
+	}
+
+	// Rewrite index.json on disk to stamp the legacy kind annotation onto every
+	// entry, simulating what AddArtifact wrote before content-derived identity.
+	indexPath := filepath.Join(storeA.Root, ocispec.ImageIndexFile)
+	data, err := os.ReadFile(indexPath)
+	if err != nil {
+		t.Fatalf("read index.json: %v", err)
+	}
+	var idx ocispec.Index
+	if err := json.Unmarshal(data, &idx); err != nil {
+		t.Fatalf("unmarshal index.json: %v", err)
+	}
+	for i := range idx.Manifests {
+		if idx.Manifests[i].Annotations == nil {
+			idx.Manifests[i].Annotations = make(map[string]string)
+		}
+		idx.Manifests[i].Annotations[consts.KindAnnotationName] = consts.KindAnnotationImage
+	}
+	out, err := json.MarshalIndent(idx, "", "  ")
+	if err != nil {
+		t.Fatalf("marshal legacy index.json: %v", err)
+	}
+	if err := os.WriteFile(indexPath, out, 0644); err != nil {
+		t.Fatalf("write legacy index.json: %v", err)
+	}
+
+	archivePath := filepath.Join(t.TempDir(), "lifecycle-file-oldformat.tar.zst")
+	saveOpts := newSaveOpts(storeA.Root, archivePath)
+	if err := SaveCmd(ctx, saveOpts, defaultRootOpts(storeA.Root), defaultCliOpts()); err != nil {
+		t.Fatalf("SaveCmd: %v", err)
+	}
+
+	storeBDir := t.TempDir()
+	loadOpts := &flags.LoadOpts{
+		StoreRootOpts: defaultRootOpts(storeBDir),
+		FileName:      []string{archivePath},
+	}
+	if err := LoadCmd(ctx, loadOpts, defaultRootOpts(storeBDir), defaultCliOpts()); err != nil {
+		t.Fatalf("LoadCmd: %v", err)
+	}
+
+	storeB, err := store.NewLayout(storeBDir)
+	if err != nil {
+		t.Fatalf("store.NewLayout(storeB): %v", err)
+	}
+	assertArtifactInStore(t, storeB, "old-lifecycle.txt")
+
+	extractDir := t.TempDir()
+	copyOpts := &flags.CopyOpts{StoreRootOpts: defaultRootOpts(storeB.Root)}
+	if err := CopyCmd(ctx, copyOpts, storeB, "dir://"+extractDir, defaultCliOpts()); err != nil {
+		t.Fatalf("CopyCmd dir: %v", err)
+	}
+
+	outPath := filepath.Join(extractDir, "old-lifecycle.txt")
+	data, err = os.ReadFile(outPath)
 	if err != nil {
 		t.Fatalf("expected extracted file at %s: %v", outPath, err)
 	}

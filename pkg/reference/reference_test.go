@@ -2,6 +2,7 @@ package reference_test
 
 import (
 	"reflect"
+	"strings"
 	"testing"
 
 	"hauler.dev/go/hauler/v2/pkg/reference"
@@ -53,5 +54,23 @@ func TestParse(t *testing.T) {
 				t.Errorf("Parse() got = %v, want %v", got, tt.want)
 			}
 		})
+	}
+}
+
+// TestRepoFromBaseRef is a regression test for #667: a digest-only base ref
+// (myorg/myimage@sha256:<hex>) must have the "@sha256:<hex>" suffix stripped
+// wholesale, not just the last colon (which would otherwise land inside the
+// digest itself).
+func TestRepoFromBaseRef(t *testing.T) {
+	cases := map[string]string{
+		"myorg/myimage@sha256:" + strings.Repeat("a", 64):   "myorg/myimage",
+		"myorg/myimage:v1.0.2":                              "myorg/myimage",
+		"myorg/myimage":                                     "myorg/myimage",
+		"nested/path/img@sha256:" + strings.Repeat("b", 64): "nested/path/img",
+	}
+	for in, want := range cases {
+		if got := reference.RepoFromBaseRef(in); got != want {
+			t.Errorf("RepoFromBaseRef(%q) = %q, want %q", in, got, want)
+		}
 	}
 }

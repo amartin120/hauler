@@ -46,6 +46,7 @@ import (
 	"helm.sh/helm/v4/pkg/action"
 
 	"hauler.dev/go/hauler/v2/internal/flags"
+	"hauler.dev/go/hauler/v2/pkg/artifacts"
 	"hauler.dev/go/hauler/v2/pkg/consts"
 	"hauler.dev/go/hauler/v2/pkg/store"
 )
@@ -358,15 +359,42 @@ func assertArtifactNotInStore(t *testing.T, s *store.Layout, refSubstring string
 	}
 }
 
-// assertArtifactKindInStore walks the store and fails if no descriptor has an
-// AnnotationRefName containing refSubstring AND KindAnnotationName equal to kind.
+// assertArtifactKindInStore walks the store and fails if no descriptor matches
+// refSubstring and kind. No descriptor carries a "kind" annotation anymore, so
+// kind here only selects which annotation shape to look for: a real
+// image/index's own ref.name still equals refSubstring directly, while a
+// sig/att/sbom/referrer's true ref.name is its own derived value -- matched by
+// the base image recorded in io.containerd.image.name (the subject pointer)
+// plus the derived shape for that artifact kind (.sig/.att/.sbom suffix, or an
+// "@digest" ref for a referrer).
 func assertArtifactKindInStore(t *testing.T, s *store.Layout, refSubstring, kind string) {
 	t.Helper()
 	found := false
 	if err := s.OCI.Walk(func(_ string, desc ocispec.Descriptor) error {
-		if strings.Contains(desc.Annotations[ocispec.AnnotationRefName], refSubstring) &&
-			desc.Annotations[consts.KindAnnotationName] == kind {
-			found = true
+		ref := desc.Annotations[ocispec.AnnotationRefName]
+		subject := desc.Annotations[consts.ContainerdImageNameKey]
+		switch kind {
+		case consts.KindAnnotationImage, consts.KindAnnotationIndex:
+			if strings.Contains(ref, refSubstring) {
+				found = true
+			}
+		case consts.KindAnnotationSigs:
+			if strings.Contains(subject, refSubstring) && strings.HasSuffix(ref, ".sig") {
+				found = true
+			}
+		case consts.KindAnnotationAtts:
+			if strings.Contains(subject, refSubstring) && strings.HasSuffix(ref, ".att") {
+				found = true
+			}
+		case consts.KindAnnotationSboms:
+			if strings.Contains(subject, refSubstring) && strings.HasSuffix(ref, ".sbom") {
+				found = true
+			}
+		default:
+			if strings.HasPrefix(kind, consts.KindAnnotationReferrers) &&
+				strings.Contains(subject, refSubstring) && strings.Contains(ref, "@") {
+				found = true
+			}
 		}
 		return nil
 	}); err != nil {
@@ -374,6 +402,86 @@ func assertArtifactKindInStore(t *testing.T, s *store.Layout, refSubstring, kind
 	}
 	if !found {
 		t.Errorf("no artifact with ref containing %q and kind %q found in store", refSubstring, kind)
+	}
+}
+
+// mergeAnnotations returns a new map containing every key/value from each of
+// maps, later maps overriding earlier ones on key collision.
+func mergeAnnotations(maps ...map[string]string) map[string]string {
+	out := make(map[string]string)
+	for _, m := range maps {
+		for k, v := range m {
+			out[k] = v
+		}
+	}
+	return out
+}
+
+// seedManifestDescriptor writes m as a real blob into s's store and adds an
+// index entry for it under annotations, so artifacts.Classify -- which
+// requires decoding real manifest content, not just an annotation -- works
+// against it. Unlike seedStoreDescriptor, which fabricates a descriptor with
+// no backing blob, this is required whenever a test needs a fixture that
+// actually classifies as something (a sig/att/sbom/referrer/chart/file/...).
+func seedManifestDescriptor(t *testing.T, s *store.Layout, m ocispec.Manifest, annotations map[string]string) ocispec.Descriptor {
+	t.Helper()
+	data, err := json.Marshal(m)
+	if err != nil {
+		t.Fatalf("seedManifestDescriptor: marshal manifest: %v", err)
+	}
+	dgst := digest.FromBytes(data)
+	if err := s.OCI.WriteBlob(context.Background(), dgst, int64(len(data)), func() (io.ReadCloser, error) {
+		return io.NopCloser(bytes.NewReader(data)), nil
+	}); err != nil {
+		t.Fatalf("seedManifestDescriptor: WriteBlob: %v", err)
+	}
+
+	mediaType := string(m.MediaType)
+	if mediaType == "" {
+		mediaType = ocispec.MediaTypeImageManifest
+	}
+	desc := ocispec.Descriptor{
+		MediaType:   mediaType,
+		Digest:      dgst,
+		Size:        int64(len(data)),
+		Annotations: annotations,
+	}
+	if err := s.OCI.AddIndex(desc); err != nil {
+		t.Fatalf("seedManifestDescriptor: AddIndex: %v", err)
+	}
+	return desc
+}
+
+// assertArtifactClassifiesAs walks the store, decodes the manifest of the
+// first descriptor whose ref.name contains refSubstring, and fails unless
+// artifacts.Classify reports want.
+func assertArtifactClassifiesAs(t *testing.T, s *store.Layout, refSubstring string, want artifacts.Kind) {
+	t.Helper()
+	found := false
+	if err := s.OCI.Walk(func(_ string, desc ocispec.Descriptor) error {
+		if found || !strings.Contains(desc.Annotations[ocispec.AnnotationRefName], refSubstring) {
+			return nil
+		}
+		rc, err := s.Fetch(context.Background(), desc)
+		if err != nil {
+			t.Fatalf("assertArtifactClassifiesAs: fetch %s: %v", desc.Digest, err)
+		}
+		defer rc.Close()
+		var m ocispec.Manifest
+		if err := json.NewDecoder(rc).Decode(&m); err != nil {
+			t.Fatalf("assertArtifactClassifiesAs: decode manifest %s: %v", desc.Digest, err)
+		}
+		if got := artifacts.Classify(desc, &m); got == want {
+			found = true
+		} else {
+			t.Errorf("artifacts.Classify(%s) = %v, want %v", desc.Digest, got, want)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("assertArtifactClassifiesAs walk: %v", err)
+	}
+	if !found {
+		t.Errorf("no artifact with ref containing %q classifying as %v found in store", refSubstring, want)
 	}
 }
 
@@ -538,8 +646,11 @@ func assertReferrerInStore(t *testing.T, s *store.Layout, refSubstring string) {
 	t.Helper()
 	found := false
 	if err := s.OCI.Walk(func(_ string, desc ocispec.Descriptor) error {
-		if strings.Contains(desc.Annotations[ocispec.AnnotationRefName], refSubstring) &&
-			strings.HasPrefix(desc.Annotations[consts.KindAnnotationName], consts.KindAnnotationReferrers) {
+		// A referrer's own ref.name is now its digest form (repo@<referrerDigest>),
+		// so refSubstring (the base image's tag-form ref) is matched against the
+		// subject pointer, io.containerd.image.name, instead.
+		if strings.Contains(desc.Annotations[consts.ContainerdImageNameKey], refSubstring) &&
+			strings.Contains(desc.Annotations[ocispec.AnnotationRefName], "@") {
 			found = true
 		}
 		return nil

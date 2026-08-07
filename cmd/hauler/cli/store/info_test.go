@@ -13,9 +13,11 @@ import (
 	digest "github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/rs/zerolog"
+	ctypes "github.com/sigstore/cosign/v3/pkg/types"
 
 	"hauler.dev/go/hauler/v2/internal/flags"
 	v1 "hauler.dev/go/hauler/v2/pkg/apis/hauler.cattle.io/v1"
+	"hauler.dev/go/hauler/v2/pkg/artifacts"
 	"hauler.dev/go/hauler/v2/pkg/consts"
 	"hauler.dev/go/hauler/v2/pkg/store"
 )
@@ -114,91 +116,83 @@ func TestNewItem(t *testing.T) {
 	// We pass nil to keep tests dependency-free.
 	const validRef = "myrepo/myimage:latest"
 
-	makeDesc := func(kindAnnotation string) ocispec.Descriptor {
-		desc := ocispec.Descriptor{
-			Annotations: map[string]string{
-				"io.containerd.image.name": validRef,
-			},
-		}
-		if kindAnnotation != "" {
-			desc.Annotations[consts.KindAnnotationName] = kindAnnotation
-		}
-		return desc
-	}
-	makeManifest := func(configMediaType string) ocispec.Manifest {
-		return ocispec.Manifest{
-			Config: ocispec.Descriptor{MediaType: configMediaType},
-		}
+	desc := ocispec.Descriptor{
+		Annotations: map[string]string{
+			"io.containerd.image.name": validRef,
+		},
 	}
 
 	tests := []struct {
-		name           string
-		configMedia    string
-		kindAnnotation string
-		typeFilter     string
-		wantType       string
-		wantEmpty      bool
+		name       string
+		m          ocispec.Manifest
+		typeFilter string
+		wantType   string
+		wantEmpty  bool
 	}{
 		{
-			name:        "DockerConfigJSON → image",
-			configMedia: consts.DockerConfigJSON,
-			typeFilter:  "all",
-			wantType:    "image",
+			name:       "DockerConfigJSON → image",
+			m:          ocispec.Manifest{Config: ocispec.Descriptor{MediaType: consts.DockerConfigJSON}},
+			typeFilter: "all",
+			wantType:   "image",
 		},
 		{
-			name:        "ChartConfigMediaType → chart",
-			configMedia: consts.ChartConfigMediaType,
-			typeFilter:  "all",
-			wantType:    "chart",
+			name:       "ChartConfigMediaType → chart",
+			m:          ocispec.Manifest{Config: ocispec.Descriptor{MediaType: consts.ChartConfigMediaType}},
+			typeFilter: "all",
+			wantType:   "chart",
 		},
 		{
-			name:        "FileLocalConfigMediaType → file",
-			configMedia: consts.FileLocalConfigMediaType,
-			typeFilter:  "all",
-			wantType:    "file",
+			name:       "FileLocalConfigMediaType → file",
+			m:          ocispec.Manifest{Config: ocispec.Descriptor{MediaType: consts.FileLocalConfigMediaType}},
+			typeFilter: "all",
+			wantType:   "file",
 		},
 		{
-			name:           "KindAnnotationSigs → sigs",
-			configMedia:    consts.DockerConfigJSON,
-			kindAnnotation: consts.KindAnnotationSigs,
-			typeFilter:     "all",
-			wantType:       "sigs",
+			name: "cosign v2 tag-convention sig layer → sigs",
+			m: ocispec.Manifest{
+				Config: ocispec.Descriptor{MediaType: consts.DockerConfigJSON},
+				Layers: []ocispec.Descriptor{{MediaType: ctypes.SimpleSigningMediaType}},
+			},
+			typeFilter: "all",
+			wantType:   "sigs",
 		},
 		{
-			name:           "KindAnnotationAtts → atts",
-			configMedia:    consts.DockerConfigJSON,
-			kindAnnotation: consts.KindAnnotationAtts,
-			typeFilter:     "all",
-			wantType:       "atts",
+			name: "cosign v2 tag-convention DSSE layer → atts",
+			m: ocispec.Manifest{
+				Config: ocispec.Descriptor{MediaType: consts.DockerConfigJSON},
+				Layers: []ocispec.Descriptor{{MediaType: ctypes.DssePayloadType}},
+			},
+			typeFilter: "all",
+			wantType:   "atts",
 		},
 		{
-			name:           "KindAnnotationReferrers prefix → referrer",
-			configMedia:    consts.DockerConfigJSON,
-			kindAnnotation: consts.KindAnnotationReferrers + "/abc123",
-			typeFilter:     "all",
-			wantType:       "referrer",
+			name: "v3 referrer, unrecognized artifactType → referrer",
+			m: ocispec.Manifest{
+				Subject: &ocispec.Descriptor{MediaType: ocispec.MediaTypeImageManifest, Digest: digest.Digest("sha256:" + strings.Repeat("a", 64))},
+			},
+			typeFilter: "all",
+			wantType:   "referrer",
 		},
 		{
-			name:        "TypeFilter:image with chart → empty item",
-			configMedia: consts.ChartConfigMediaType,
-			typeFilter:  "image",
-			wantEmpty:   true,
+			name:       "TypeFilter:image with chart → empty item",
+			m:          ocispec.Manifest{Config: ocispec.Descriptor{MediaType: consts.ChartConfigMediaType}},
+			typeFilter: "image",
+			wantEmpty:  true,
 		},
 		{
-			name:        "TypeFilter:file with image → empty item",
-			configMedia: consts.DockerConfigJSON,
-			typeFilter:  "file",
-			wantEmpty:   true,
+			name:       "TypeFilter:file with image → empty item",
+			m:          ocispec.Manifest{Config: ocispec.Descriptor{MediaType: consts.DockerConfigJSON}},
+			typeFilter: "file",
+			wantEmpty:  true,
 		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			desc := makeDesc(tc.kindAnnotation)
-			m := makeManifest(tc.configMedia)
 			o := &flags.InfoOpts{TypeFilter: tc.typeFilter}
+			ctype := displayType(artifacts.Classify(desc, &tc.m))
 
-			got := newItem(nil, desc, m, "linux/amd64", o)
+			got := newItem(desc, tc.m, "linux/amd64", o, ctype)
 			if tc.wantEmpty {
 				if !got.isEmpty() {
 					t.Errorf("expected empty item, got %+v", got)

@@ -27,6 +27,7 @@ import (
 	"github.com/opencontainers/go-digest"
 	"github.com/opencontainers/image-spec/specs-go"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
+	zlog "github.com/rs/zerolog/log"
 
 	"hauler.dev/go/hauler/v2/pkg/consts"
 	"hauler.dev/go/hauler/v2/pkg/reference"
@@ -170,12 +171,13 @@ func (o *OCI) AddIndex(desc ocispec.Descriptor) error {
 		return nil
 	}
 
+	// Every descriptor now carries its own true reference, so the ref alone is
+	// unique -- no more "-kind" suffix needed to keep sig/att/sbom/referrer entries
+	// (which used to all share the base image's ref) from colliding.
 	var mapKey string
 	switch key.(type) {
-	case name.Digest:
-		mapKey = fmt.Sprintf("%s-%s", key.Context().String(), desc.Annotations[consts.KindAnnotationName])
-	case name.Tag:
-		mapKey = fmt.Sprintf("%s-%s", key.String(), desc.Annotations[consts.KindAnnotationName])
+	case name.Digest, name.Tag:
+		mapKey = key.String()
 	default:
 		return nil
 	}
@@ -257,38 +259,112 @@ func (o *OCI) loadIndexLocked() error {
 		return err
 	}
 
+	// Pass 1: record every real image/index (or already-migrated, kind-free)
+	// entry's digest by its own ref name. Pass 2 uses this to derive a legacy
+	// sig/att/sbom/referrer's true, unique ref from the base image ref it
+	// (wrongly) shares on disk in an old-format store.
+	refToDigest := make(map[string]string, len(o.index.Manifests))
+	for _, desc := range o.index.Manifests {
+		kind := consts.NormalizeLegacyKind(desc.Annotations[consts.KindAnnotationName])
+		if isLegacyArtifactKind(kind) {
+			continue
+		}
+		if refName := desc.Annotations[ocispec.AnnotationRefName]; refName != "" {
+			refToDigest[refName] = desc.Digest.String()
+		}
+	}
+
 	for _, desc := range o.index.Manifests {
 		key, err := reference.Parse(desc.Annotations[ocispec.AnnotationRefName])
 		if err != nil {
 			// skip malformed entries rather than making the entire store unreadable
 			continue
 		}
-
-		// Set default kind if missing... normalize legacy dev.cosignproject.cosign values
-		kind := desc.Annotations[consts.KindAnnotationName]
-		kind = consts.NormalizeLegacyKind(kind)
-		if kind == "" {
-			kind = consts.KindAnnotationImage
+		if strings.TrimSpace(key.String()) == "--" {
+			continue
 		}
 
-		// Write normalized kind into a copy of Annotations so Walk() callers
-		// see it, without mutating the slice element's shared map.
-		normalized := make(map[string]string, len(desc.Annotations)+1)
+		kind := consts.NormalizeLegacyKind(desc.Annotations[consts.KindAnnotationName])
+
+		// Write into a copy of Annotations so Walk() callers see the migrated
+		// shape, without mutating the slice element's shared map.
+		normalized := make(map[string]string, len(desc.Annotations))
 		maps.Copy(normalized, desc.Annotations)
-		normalized[consts.KindAnnotationName] = kind
-		desc.Annotations = normalized
 
-		if strings.TrimSpace(key.String()) != "--" {
-			switch key.(type) {
-			case name.Digest:
-				o.nameMap.Store(fmt.Sprintf("%s-%s", key.Context().String(), kind), desc)
-			case name.Tag:
-				o.nameMap.Store(fmt.Sprintf("%s-%s", key.String(), kind), desc)
-			}
+		if !isLegacyArtifactKind(kind) {
+			// Real image/index, chart, file, or an entry that was already
+			// written kind-free -- no ref to rewrite. `kind` still gets
+			// dropped so the store converges to the fully kind-free shape
+			// once anything triggers a SaveIndex.
+			delete(normalized, consts.KindAnnotationName)
+			desc.Annotations = normalized
+			o.nameMap.Store(key.String(), desc)
+			continue
 		}
+
+		// Legacy sig/att/sbom/referrer: org.opencontainers.image.ref.name on disk is
+		// still the *base image's* ref (every artifact for one image shared it, which
+		// is exactly the ref-collision bug this migration fixes), so derive this
+		// artifact's own true ref from the base image's manifest digest via the
+		// cosign tag convention / referrer digest form -- the same derivation
+		// copy.go used to do at push time.
+		baseRefName := desc.Annotations[ocispec.AnnotationRefName]
+		parentDigest, ok := refToDigest[baseRefName]
+		if !ok {
+			// Orphaned: the base image isn't in this store (e.g. it was removed on
+			// its own), so the true ref can't be derived. Retain the old compound
+			// key rather than lose the entry.
+			zlog.Debug().Str("ref", baseRefName).Str("kind", kind).
+				Msg("loadIndexLocked: base image not found for legacy sig/att/sbom/referrer entry; retaining old compound key")
+			normalized[consts.KindAnnotationName] = kind
+			desc.Annotations = normalized
+			o.nameMap.Store(fmt.Sprintf("%s-%s", baseRefName, kind), desc)
+			continue
+		}
+
+		repo := reference.RepoFromBaseRef(baseRefName)
+		var newRefName string
+		switch kind {
+		case consts.KindAnnotationSigs:
+			newRefName = repo + ":" + strings.ReplaceAll(parentDigest, ":", "-") + ".sig"
+		case consts.KindAnnotationAtts:
+			newRefName = repo + ":" + strings.ReplaceAll(parentDigest, ":", "-") + ".att"
+		case consts.KindAnnotationSboms:
+			newRefName = repo + ":" + strings.ReplaceAll(parentDigest, ":", "-") + ".sbom"
+		default: // referrers: unique via the referrer manifest's own digest, not the parent's
+			newRefName = repo + "@" + desc.Digest.String()
+		}
+
+		newKey, err := reference.Parse(newRefName)
+		if err != nil {
+			zlog.Debug().Err(err).Str("ref", newRefName).
+				Msg("loadIndexLocked: could not parse derived true ref; retaining old compound key")
+			normalized[consts.KindAnnotationName] = kind
+			desc.Annotations = normalized
+			o.nameMap.Store(fmt.Sprintf("%s-%s", baseRefName, kind), desc)
+			continue
+		}
+
+		delete(normalized, consts.KindAnnotationName)
+		normalized[ocispec.AnnotationRefName] = newRefName
+		desc.Annotations = normalized
+		o.nameMap.Store(newKey.String(), desc)
 	}
 
 	return nil
+}
+
+// isLegacyArtifactKind reports whether kind (already run through
+// consts.NormalizeLegacyKind) identifies a legacy sig/att/sbom/referrer entry --
+// the ones that need ref-name migration in loadIndexLocked. A real image, index,
+// chart, file, or an entry with no kind annotation at all (already kind-free)
+// returns false.
+func isLegacyArtifactKind(kind string) bool {
+	switch kind {
+	case consts.KindAnnotationSigs, consts.KindAnnotationAtts, consts.KindAnnotationSboms:
+		return true
+	}
+	return strings.HasPrefix(kind, consts.KindAnnotationReferrers)
 }
 
 // SaveIndex will update the index on disk.
@@ -296,6 +372,27 @@ func (o *OCI) SaveIndex() error {
 	o.lock()
 	defer o.mu.Unlock()
 	return o.saveIndexLocked(true)
+}
+
+// isRealImageOrIndex reports whether d is a genuine image/index entry rather
+// than a sig/att/sbom/referrer descriptor pointing at one. It strips the
+// registry host (everything up to the first slash) from io.containerd.image.name
+// and compares what remains to org.opencontainers.image.ref.name: a real
+// image/index entry's two annotations agree once the host is removed, since
+// writeImage/writeIndex always populate a host -- store.go's AddImage parses
+// with go-containerregistry's default (never-empty) registry -- whereas a
+// sig/att/sbom/referrer descriptor carries the base image's full ref in
+// io.containerd.image.name but its own derived value in ref.name, so the two
+// never match.
+func isRealImageOrIndex(d ocispec.Descriptor) bool {
+	containerdName := d.Annotations[consts.ContainerdImageNameKey]
+	if containerdName == "" {
+		return false
+	}
+	if slash := strings.Index(containerdName, "/"); slash != -1 {
+		containerdName = containerdName[slash+1:]
+	}
+	return containerdName == d.Annotations[ocispec.AnnotationRefName]
 }
 
 // saveIndexLocked is SaveIndex's implementation. Callers must hold o.mu.
@@ -322,18 +419,17 @@ func (o *OCI) saveIndexLocked(durable bool) error {
 		return true
 	})
 
-	// sort index to ensure that images come before any signatures and attestations.
+	// Sort index so real images/indexes come before sig/att/sbom/referrer entries.
+	// Since writeImage/writeIndex stopped writing a "kind" annotation at all, use
+	// the same subject-pointer invariant content.ContainerdImageNameKey's doc
+	// comment establishes:
+	// a real image/index's io.containerd.image.name (registry-stripped) equals
+	// its own ref.name, but is deliberately the *base* image's ref -- different
+	// from the descriptor's own ref.name -- for anything that points at one.
 	sort.SliceStable(descs, func(i, j int) bool {
-		kindI := descs[i].Annotations["kind"]
-		kindJ := descs[j].Annotations["kind"]
-
-		// Objects with the prefix of KindAnnotationImage should be at the top.
-		if strings.HasPrefix(kindI, consts.KindAnnotationImage) && !strings.HasPrefix(kindJ, consts.KindAnnotationImage) {
-			return true
-		} else if !strings.HasPrefix(kindI, consts.KindAnnotationImage) && strings.HasPrefix(kindJ, consts.KindAnnotationImage) {
-			return false
-		}
-		return false // Default: maintain the order.
+		iIsImage := isRealImageOrIndex(descs[i])
+		jIsImage := isRealImageOrIndex(descs[j])
+		return iIsImage && !jIsImage
 	})
 
 	o.index.Manifests = descs
@@ -778,6 +874,19 @@ func (p *ociPusher) Push(ctx context.Context, d ocispec.Descriptor) (ccontent.Wr
 	case ocispec.MediaTypeImageManifest, ocispec.MediaTypeImageIndex, consts.DockerManifestSchema2, consts.DockerManifestListSchema2:
 		// if the hash of the content matches that which was provided as the hash for the root, mark it
 		if p.digest != "" && p.digest == d.Digest.String() {
+			// d traces back to OCI.Resolve's full descriptor (Copy resolves the source
+			// descriptor and threads it straight through copyDescriptorGraph to this
+			// Push call), so its own ref.name annotation -- not p.ref, which Pusher
+			// already split the digest off of -- is the true key to store under.
+			refName, ok := d.Annotations[ocispec.AnnotationRefName]
+			if !ok {
+				return nil, fmt.Errorf("descriptor must contain a reference from the annotation: %s", ocispec.AnnotationRefName)
+			}
+			key, err := reference.Parse(refName)
+			if err != nil {
+				return nil, err
+			}
+
 			// Single critical section (Locked variants, to avoid deadlocking
 			// on this same lock) so no other save can land in between.
 			p.oci.lock()
@@ -785,21 +894,14 @@ func (p *ociPusher) Push(ctx context.Context, d ocispec.Descriptor) (ccontent.Wr
 				p.oci.mu.Unlock()
 				return nil, err
 			}
-			// Use compound key format: "reference-kind"; normalize legacy values.
-			kind := d.Annotations[consts.KindAnnotationName]
-			kind = consts.NormalizeLegacyKind(kind)
-			if kind == "" {
-				kind = consts.KindAnnotationImage
-			}
-			// Copy annotations map to avoid mutating the caller's descriptor,
-			// then write the normalized kind so Walk() callers see dev.hauler/... values.
-			normalizedAnnotations := make(map[string]string, len(d.Annotations)+1)
+			// Copy the annotations map before storing: this OCI's nameMap must never
+			// alias a map instance the caller (or, in the self-sync case, this same
+			// OCI's other nameMap entries) still holds a reference to.
+			normalizedAnnotations := make(map[string]string, len(d.Annotations))
 			maps.Copy(normalizedAnnotations, d.Annotations)
-			normalizedAnnotations[consts.KindAnnotationName] = kind
 			d.Annotations = normalizedAnnotations
-			key := fmt.Sprintf("%s-%s", p.ref, kind)
-			p.oci.nameMap.Store(key, d)
-			err := p.oci.saveIndexCheckpointLocked()
+			p.oci.nameMap.Store(key.String(), d)
+			err = p.oci.saveIndexCheckpointLocked()
 			p.oci.mu.Unlock()
 			if err != nil {
 				return nil, err

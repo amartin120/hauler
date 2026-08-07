@@ -20,6 +20,7 @@ import (
 	v1 "hauler.dev/go/hauler/v2/pkg/apis/hauler.cattle.io/v1"
 	"hauler.dev/go/hauler/v2/pkg/consts"
 	"hauler.dev/go/hauler/v2/pkg/content"
+	"hauler.dev/go/hauler/v2/pkg/reference"
 	"hauler.dev/go/hauler/v2/pkg/store"
 )
 
@@ -84,32 +85,20 @@ func TestCopyCmd_UnknownProtocol(t *testing.T) {
 }
 
 // --------------------------------------------------------------------------
-// repoFromBaseRef / destination ref derivation tests (#667)
+// destination ref derivation tests (#667) -- repoFromBaseRef itself now lives
+// at reference.RepoFromBaseRef (pkg/reference/reference_test.go).
 // --------------------------------------------------------------------------
 
-func TestRepoFromBaseRef(t *testing.T) {
-	cases := map[string]string{
-		"myorg/myimage@sha256:" + strings.Repeat("a", 64):   "myorg/myimage",
-		"myorg/myimage:v1.0.2":                              "myorg/myimage",
-		"myorg/myimage":                                     "myorg/myimage",
-		"nested/path/img@sha256:" + strings.Repeat("b", 64): "nested/path/img",
-	}
-	for in, want := range cases {
-		if got := repoFromBaseRef(in); got != want {
-			t.Errorf("repoFromBaseRef(%q) = %q, want %q", in, got, want)
-		}
-	}
-}
-
-// TestDestRef_DigestOnly_Parses is a regression test for #667: destination refs
-// derived for artifacts of a digest-only image must be parseable by the real
-// RewriteRefToRegistry.
+// TestDestRef_DigestOnly_Parses is a regression test for #667: the cosign-tag
+// and referrer-digest ref shapes derived at write time (store.go's
+// saveRelatedArtifacts/saveReferrers) for artifacts of a digest-only image must
+// be parseable by the real RewriteRefToRegistry.
 func TestDestRef_DigestOnly_Parses(t *testing.T) {
 	imgDigest := "sha256:" + strings.Repeat("a", 64)
 	refDigestHex := strings.Repeat("c", 64)
 	base := "myorg/myimage@" + imgDigest // tag@digest ingests to digest-only
 
-	repo := repoFromBaseRef(base)
+	repo := reference.RepoFromBaseRef(base)
 
 	// sig/att/sbom cosign tag
 	sigDest := repo + ":" + strings.ReplaceAll(imgDigest, ":", "-") + ".sig"
@@ -251,6 +240,73 @@ func TestCopyCmd_Registry_SigTagDerivation(t *testing.T) {
 	}
 }
 
+// TestCopyCmd_Registry_AllArtifactKindsLandAtSameDestRefs is a regression test:
+// destRef became baseRef unconditionally once every descriptor's own ref.name
+// was already its true, correct value, which removed copy.go's refDigest
+// pre-pass and sigExts map entirely. This proves that removal is
+// behavior-preserving for every artifact kind that pre-pass used to handle
+// specially -- sig, att, sbom (cosign tag convention) and an OCI 1.1 referrer
+// (pushed by manifest digest) -- by asserting each lands at the exact
+// destination ref the old two-pass derivation would have produced.
+func TestCopyCmd_Registry_AllArtifactKindsLandAtSameDestRefs(t *testing.T) {
+	ctx := newTestContext(t)
+
+	srcHost, _ := newLocalhostRegistry(t)
+	srcImg := seedImage(t, srcHost, "test/allkinds", "v1")
+	seedCosignV2Artifacts(t, srcHost, "test/allkinds", srcImg)
+	seedOCI11Referrer(t, srcHost, "test/allkinds", srcImg)
+
+	s := newTestStore(t)
+	if _, err := s.AddImage(ctx, srcHost+"/test/allkinds:v1", "", false, ""); err != nil {
+		t.Fatalf("AddImage: %v", err)
+	}
+
+	dstHost, dstOpts := newTestRegistry(t)
+	o := &flags.CopyOpts{StoreRootOpts: defaultRootOpts(s.Root), PlainHTTP: true}
+	if err := CopyCmd(ctx, o, s, "registry://"+dstHost, defaultCliOpts()); err != nil {
+		t.Fatalf("CopyCmd: %v", err)
+	}
+
+	hash, err := srcImg.Digest()
+	if err != nil {
+		t.Fatalf("srcImg.Digest: %v", err)
+	}
+	digestTag := strings.ReplaceAll(hash.String(), ":", "-")
+
+	for _, ext := range []string{".sig", ".att", ".sbom"} {
+		ref, err := name.NewTag(dstHost+"/test/allkinds:"+digestTag+ext, name.Insecure)
+		if err != nil {
+			t.Fatalf("name.NewTag %s: %v", ext, err)
+		}
+		if _, err := remote.Get(ref, dstOpts...); err != nil {
+			t.Errorf("%s not found at expected cosign tag in target registry: %v", ext, err)
+		}
+	}
+
+	// The referrer must land at its own manifest digest (repo@sha256:...) so the
+	// target registry can wire up the subject/referrers relationship.
+	var referrerFound bool
+	if err := s.OCI.Walk(func(_ string, desc ocispec.Descriptor) error {
+		if strings.Contains(desc.Annotations[consts.ContainerdImageNameKey], "test/allkinds") &&
+			strings.Contains(desc.Annotations[ocispec.AnnotationRefName], "@") {
+			referrerFound = true
+			ref, err := name.NewDigest(dstHost+"/test/allkinds@"+desc.Digest.String(), name.Insecure)
+			if err != nil {
+				t.Fatalf("name.NewDigest referrer: %v", err)
+			}
+			if _, err := remote.Get(ref, dstOpts...); err != nil {
+				t.Errorf("referrer not found at expected digest ref in target registry: %v", err)
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("Walk: %v", err)
+	}
+	if !referrerFound {
+		t.Fatal("expected an OCI referrer entry in the source store, found none")
+	}
+}
+
 // TestCopyCmd_Registry_IgnoreErrors verifies that a push failure to a
 // non-listening address is swallowed when IgnoreErrors is set.
 func TestCopyCmd_Registry_IgnoreErrors(t *testing.T) {
@@ -334,18 +390,17 @@ func TestCopyCmd_Registry_IgnoreErrors_EnvVar_MultipleArtifacts(t *testing.T) {
 		}
 	}
 
-	// Seed an undeliverable referrer descriptor directly, per the technique used
-	// in TestCopy_UndeliverableArtifact_RespectsIgnoreErrors, so that one artifact
-	// fails ref-rewriting (copy.go's earlier IgnoreErrors check) while the two
+	// Seed an undeliverable descriptor directly, per the technique used in
+	// TestCopy_UndeliverableArtifact_RespectsIgnoreErrors, so that one artifact
+	// fails to copy (its manifest blob doesn't exist on disk) while the two
 	// images above should still make it to the target registry.
 	desc := ocispec.Descriptor{
 		MediaType: ocispec.MediaTypeImageManifest,
-		Digest:    digest.Digest("sha256:not a valid digest"),
+		Digest:    digest.Digest("sha256:" + strings.Repeat("f", 64)), // well-formed, no blob on disk
 		Size:      1,
 		Annotations: map[string]string{
 			ocispec.AnnotationRefName:     "myorg/undeliverable",
 			consts.ContainerdImageNameKey: "myorg/undeliverable",
-			consts.KindAnnotationName:     consts.KindAnnotationReferrers + "/" + strings.Repeat("a", 64),
 		},
 	}
 	if err := s.OCI.AddIndex(desc); err != nil {
@@ -375,16 +430,16 @@ func TestCopyCmd_Registry_IgnoreErrors_EnvVar_MultipleArtifacts(t *testing.T) {
 }
 
 // TestCopy_UndeliverableArtifact_RespectsIgnoreErrors verifies that when
-// CopyCmd's registry branch derives an unparseable destination ref for an
-// artifact (RewriteRefToRegistry failure), the walk fails by default and
-// only swallows the error when --ignore-errors is set (#667).
+// CopyCmd's registry branch fails to copy an artifact, the walk fails by
+// default and only swallows the error when --ignore-errors is set (#667).
 //
 // AnnotationRefName is validated on the way into the store's index (AddIndex
-// parses it), so a malformed ref name can never reach CopyCmd's walk. The
-// referrer destRef, however, is derived from the descriptor's raw Digest
-// field ("<repo>@<digest>"), which is never validated as a reference. Seeding
-// a referrer descriptor with a Digest containing a space reproduces the
-// derivation failure without needing an actually malformed AnnotationRefName.
+// parses it), so a malformed ref name can never reach CopyCmd's walk, and
+// since every descriptor's own ref.name is already its true, correctly-formed
+// ref, there's no longer a destination-ref-derivation step in copy.go left to
+// fail. A descriptor whose manifest blob was never actually written
+// (well-formed digest, no file on disk) reproduces an equally real
+// "undeliverable artifact": s.Copy fails to fetch it.
 func TestCopy_UndeliverableArtifact_RespectsIgnoreErrors(t *testing.T) {
 	ctx := newTestContext(t)
 
@@ -392,12 +447,11 @@ func TestCopy_UndeliverableArtifact_RespectsIgnoreErrors(t *testing.T) {
 		s := newTestStore(t)
 		desc := ocispec.Descriptor{
 			MediaType: ocispec.MediaTypeImageManifest,
-			Digest:    digest.Digest("sha256:not a valid digest"),
+			Digest:    digest.Digest("sha256:" + strings.Repeat("f", 64)), // well-formed, no blob on disk
 			Size:      1,
 			Annotations: map[string]string{
 				ocispec.AnnotationRefName:     "myorg/myimage",
 				consts.ContainerdImageNameKey: "myorg/myimage",
-				consts.KindAnnotationName:     consts.KindAnnotationReferrers + "/" + strings.Repeat("a", 64),
 			},
 		}
 		if err := s.OCI.AddIndex(desc); err != nil {

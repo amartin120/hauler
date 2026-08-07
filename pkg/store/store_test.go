@@ -235,24 +235,6 @@ func findRefKey(t *testing.T, s *store.Layout, ref string) string {
 	return key
 }
 
-// findRefKeyByKind walks the store's index and returns the nameMap key for the
-// descriptor whose AnnotationRefName matches ref and whose kind annotation matches kind.
-func findRefKeyByKind(t *testing.T, s *store.Layout, ref, kind string) string {
-	t.Helper()
-	var key string
-	_ = s.OCI.Walk(func(reference string, desc ocispec.Descriptor) error {
-		if desc.Annotations[ocispec.AnnotationRefName] == ref &&
-			desc.Annotations[consts.KindAnnotationName] == kind {
-			key = reference
-		}
-		return nil
-	})
-	if key == "" {
-		t.Fatalf("reference %q with kind %q not found in store", ref, kind)
-	}
-	return key
-}
-
 // readManifestBlob reads and parses an OCI manifest from the store's blob directory.
 func readManifestBlob(t *testing.T, root string, d digest.Digest) ocispec.Manifest {
 	t.Helper()
@@ -471,8 +453,9 @@ func TestCopyDescriptorGraph_Index(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Locate the index descriptor (kind=imageIndex) in the source store.
-	refKey := findRefKeyByKind(t, src, "test/multiarch:v1", consts.KindAnnotationIndex)
+	// Locate the index descriptor in the source store -- its own ref.name is
+	// unique on its own now, no kind disambiguation needed.
+	refKey := findRefKey(t, src, "test/multiarch:v1")
 
 	// Copy the entire index graph to a fresh destination store.
 	dstRoot := t.TempDir()
@@ -772,9 +755,14 @@ func TestAddImage_OCI11Referrers(t *testing.T) {
 	}
 
 	// 5. Walk the store and verify that at least one referrer entry was captured.
+	// A referrer's own true ref is now its digest form (repo@<referrerDigest>,
+	// built from digestRef in saveReferrers) -- unlike the base image's tag-form
+	// ref, so an "@" in ref.name for this repo identifies it without needing a
+	// kind annotation.
 	var referrerCount int
 	if err := s.Walk(func(_ string, desc ocispec.Descriptor) error {
-		if strings.HasPrefix(desc.Annotations[consts.KindAnnotationName], consts.KindAnnotationReferrers) {
+		refName := desc.Annotations[ocispec.AnnotationRefName]
+		if strings.Contains(refName, "test/image") && strings.Contains(refName, "@") {
 			referrerCount++
 		}
 		return nil

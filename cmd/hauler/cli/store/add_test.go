@@ -38,6 +38,7 @@ import (
 
 	"hauler.dev/go/hauler/v2/internal/flags"
 	v1 "hauler.dev/go/hauler/v2/pkg/apis/hauler.cattle.io/v1"
+	"hauler.dev/go/hauler/v2/pkg/artifacts"
 	"hauler.dev/go/hauler/v2/pkg/consts"
 	"hauler.dev/go/hauler/v2/pkg/log"
 	"hauler.dev/go/hauler/v2/pkg/store"
@@ -666,21 +667,9 @@ func TestStoreImage_ExcludeExtras(t *testing.T) {
 		}
 		assertArtifactKindInStore(t, s, "test/signed:v1", consts.KindAnnotationImage)
 
-		// Verify no sig/att/sbom kind annotations are present.
-		for _, kind := range []string{consts.KindAnnotationSigs, consts.KindAnnotationAtts, consts.KindAnnotationSboms} {
-			found := false
-			if err := s.OCI.Walk(func(_ string, desc ocispec.Descriptor) error {
-				if desc.Annotations[consts.KindAnnotationName] == kind {
-					found = true
-				}
-				return nil
-			}); err != nil {
-				t.Fatalf("walk: %v", err)
-			}
-			if found {
-				t.Errorf("unexpected artifact with kind %q found in store", kind)
-			}
-		}
+		// Verify no sig/att/sbom artifacts are present: with only the primary
+		// image in the store, its own count==1 assertion above already proves
+		// this, since AddImage would have added them as separate entries.
 	})
 
 	t.Run("OCI 1.1 referrers excluded when excludeExtras=true", func(t *testing.T) {
@@ -701,20 +690,6 @@ func TestStoreImage_ExcludeExtras(t *testing.T) {
 		count := countArtifactsInStore(t, s)
 		if count != 1 {
 			t.Errorf("expected 1 artifact in store, got %d", count)
-		}
-
-		// Verify no referrer kind annotations are present.
-		found := false
-		if err := s.OCI.Walk(func(_ string, desc ocispec.Descriptor) error {
-			if strings.HasPrefix(desc.Annotations[consts.KindAnnotationName], consts.KindAnnotationReferrers) {
-				found = true
-			}
-			return nil
-		}); err != nil {
-			t.Fatalf("walk: %v", err)
-		}
-		if found {
-			t.Errorf("unexpected OCI referrer found in store when excludeExtras=true")
 		}
 	})
 
@@ -750,11 +725,12 @@ func TestAddChartCmd_LocalTgz(t *testing.T) {
 	if err := AddChartCmd(ctx, o, s, "rancher-cluster-templates-0.5.2.tgz", rso, ro); err != nil {
 		t.Fatalf("AddChartCmd: %v", err)
 	}
-	// Hauler stores all artifacts (files, charts) via store.AddArtifact, which
-	// unconditionally sets KindAnnotationName = KindAnnotationImage (see
-	// pkg/store/store.go). There is no separate "chart" kind — charts are
-	// wrapped in an OCI image manifest and tagged with KindAnnotationImage.
-	assertArtifactKindInStore(t, s, "rancher-cluster-templates", consts.KindAnnotationImage)
+	assertArtifactInStore(t, s, "rancher-cluster-templates")
+	// store.AddArtifact (used for charts and files alike) no longer stamps a
+	// "kind" annotation at all: a chart is classified as Chart from its own
+	// manifest content (Helm's config media type), not mislabeled Image just
+	// because AddArtifact wrote it.
+	assertArtifactClassifiesAs(t, s, "rancher-cluster-templates", artifacts.KindChart)
 }
 
 func TestAddChartCmd_WithFileDep(t *testing.T) {
@@ -887,20 +863,10 @@ func TestRunChartJobs_AddImages_ExcludeExtras(t *testing.T) {
 		// The discovered image is stored (bare, no extras).
 		assertArtifactInStore(t, s, "test/chart-image:v1")
 
-		// No sig / att / sbom entries must be present.
-		for _, kind := range []string{consts.KindAnnotationSigs, consts.KindAnnotationAtts, consts.KindAnnotationSboms} {
-			found := false
-			if err := s.OCI.Walk(func(_ string, desc ocispec.Descriptor) error {
-				if desc.Annotations[consts.KindAnnotationName] == kind {
-					found = true
-				}
-				return nil
-			}); err != nil {
-				t.Fatalf("walk: %v", err)
-			}
-			if found {
-				t.Errorf("unexpected artifact with kind %q found in store when ExcludeExtras=true", kind)
-			}
+		// No sig / att / sbom entries must be present: exactly the chart and the
+		// bare discovered image, nothing else.
+		if count := countArtifactsInStore(t, s); count != 2 {
+			t.Errorf("expected exactly 2 artifacts (chart + bare image) in store when ExcludeExtras=true, got %d", count)
 		}
 	})
 }

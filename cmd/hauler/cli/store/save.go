@@ -22,7 +22,8 @@ import (
 
 	"hauler.dev/go/hauler/v2/internal/flags"
 	"hauler.dev/go/hauler/v2/pkg/archives"
-	"hauler.dev/go/hauler/v2/pkg/audit"
+	"hauler.dev/go/hauler/v2/pkg/artifacts"
+    "hauler.dev/go/hauler/v2/pkg/audit"
 	"hauler.dev/go/hauler/v2/pkg/consts"
 	"hauler.dev/go/hauler/v2/pkg/log"
 	"hauler.dev/go/hauler/v2/pkg/store"
@@ -198,14 +199,11 @@ func writeExportsManifest(ctx context.Context, dir string, platformStr string) e
 			l.Debugf("descriptor [%s] <<< SKIPPING ARTIFACT [%q]", desc.Digest.String(), desc.ArtifactType)
 			continue
 		}
-		// The kind annotation is the only reliable way to distinguish container images from
-		// cosign signatures/attestations/SBOMs: those are stored as standard Docker/OCI
-		// manifests (same media type as real images) so media type alone is insufficient.
-		kind := desc.Annotations[consts.KindAnnotationName]
-		if kind != consts.KindAnnotationImage && kind != consts.KindAnnotationIndex {
-			l.Debugf("descriptor [%s] <<< SKIPPING KIND [%q]", desc.Digest.String(), kind)
-			continue
-		}
+		// Charts, files, and cosign sig/att/sbom/referrer manifests all share the same
+		// descriptor-level media type as a real image (a single OCI manifest, as opposed
+		// to an index) -- x.record classifies each one from its own decoded manifest
+		// content (artifacts.Classify) and excludes everything but a real image there,
+		// so no media-type-only filter can substitute for it here.
 
 		refName, hasRefName := desc.Annotations[consts.ContainerdImageNameKey]
 		if !hasRefName {
@@ -290,14 +288,21 @@ func (x *exports) record(ctx context.Context, index libv1.ImageIndex, desc libv1
 		return err
 	}
 
-	// Verify this is a real container image by inspecting its manifest config media type.
-	// Non-image OCI artifacts (Helm charts, files, cosign sigs) use distinct config types.
-	manifest, err := image.Manifest()
+	// Verify this is a real container image by classifying its actual manifest content
+	// (artifacts.Classify), not by which subcommand added it. Non-image OCI artifacts
+	// (Helm charts, files, cosign sigs/atts/sboms/referrers) all decode as a perfectly
+	// valid libv1.Image here -- ggcr doesn't care what the config media type is -- so
+	// this is the only reliable way to keep them out of the docker-archive export.
+	rawManifest, err := image.RawManifest()
 	if err != nil {
 		return err
 	}
-	if manifest.Config.MediaType != types.DockerConfigJSON && manifest.Config.MediaType != types.OCIConfigJSON {
-		l.Debugf("descriptor [%s] <<< SKIPPING NON-IMAGE config media type [%q]", desc.Digest.String(), manifest.Config.MediaType)
+	var ociManifest ocispec.Manifest
+	if err := json.Unmarshal(rawManifest, &ociManifest); err != nil {
+		return err
+	}
+	if kind := artifacts.Classify(ocispec.Descriptor{MediaType: string(desc.MediaType)}, &ociManifest); kind != artifacts.KindImage {
+		l.Debugf("descriptor [%s] <<< SKIPPING NON-IMAGE content [%s]", desc.Digest.String(), kind)
 		return nil
 	}
 

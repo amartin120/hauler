@@ -46,6 +46,23 @@ func Parse(ref string) (gname.Reference, error) {
 	return r, nil
 }
 
+// RepoFromBaseRef strips any digest and/or tag from a stored ref name, yielding
+// just the repository path. A hauler index's ref.name never contains a registry
+// host, so the only colons come from a tag or the digest algorithm separator. A
+// digest-only ref (myorg/myimage@sha256:<hex>) must strip the "@sha256:<hex>"
+// suffix rather than the last colon, which would otherwise land inside the
+// digest (#667).
+func RepoFromBaseRef(baseRef string) string {
+	repo := baseRef
+	if at := strings.Index(repo, "@"); at != -1 {
+		repo = repo[:at]
+	}
+	if colon := strings.LastIndex(repo, ":"); colon != -1 {
+		repo = repo[:colon]
+	}
+	return repo
+}
+
 // Relocate returns a name.Reference given a reference and registry
 func Relocate(reference string, registry string) (gname.Reference, error) {
 	ref, err := gname.ParseReference(reference)

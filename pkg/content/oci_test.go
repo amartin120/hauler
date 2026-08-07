@@ -73,9 +73,15 @@ func fakeDigest(hex string) digest.Digest {
 // --------------------------------------------------------------------------
 
 // TestLoadIndex_NormalizesLegacyKindInDescriptorAnnotations verifies that
-// after LoadIndex() (called implicitly by Walk()), every descriptor returned
-// by Walk carries a normalized dev.hauler/... kind annotation, not the legacy
-// dev.cosignproject.cosign/... value stored on disk.
+// after LoadIndex() (called implicitly by Walk()), a real image/index
+// descriptor carries no "kind" annotation at all (the write path never sets
+// one, and loadIndexLocked's migration drops it from every already-correct
+// entry too, converging the whole store to the kind-free shape). A
+// sig/att/sbom/referrer descriptor whose base image isn't present in this
+// same fixture can't have its true ref derived, so it's retained under its
+// old compound key -- but even there, a
+// legacy dev.cosignproject.cosign/... value must never survive untranslated;
+// NormalizeLegacyKind is applied before the orphan check runs.
 func TestLoadIndex_NormalizesLegacyKindInDescriptorAnnotations(t *testing.T) {
 	dir := t.TempDir()
 
@@ -116,22 +122,168 @@ func TestLoadIndex_NormalizesLegacyKindInDescriptorAnnotations(t *testing.T) {
 		t.Fatalf("Walk: %v", err)
 	}
 
-	if len(walked) == 0 {
-		t.Fatal("Walk returned no descriptors")
+	if len(walked) != len(legacyKinds) {
+		t.Fatalf("Walk returned %d descriptors, want %d", len(walked), len(legacyKinds))
 	}
 
 	const legacyPrefix = "dev.cosignproject.cosign"
 	const newPrefix = "dev.hauler"
 	for _, desc := range walked {
-		kind := desc.Annotations[consts.KindAnnotationName]
+		kind, hasKind := desc.Annotations[consts.KindAnnotationName]
 		if strings.HasPrefix(kind, legacyPrefix) {
-			t.Errorf("descriptor %s: Walk returned legacy kind %q... want normalized dev.hauler/... value",
+			t.Errorf("descriptor %s: Walk returned legacy kind %q... want it translated or dropped entirely",
 				desc.Digest, kind)
 		}
-		if !strings.HasPrefix(kind, newPrefix) {
-			t.Errorf("descriptor %s: Walk returned unexpected kind %q... want dev.hauler/... prefix",
-				desc.Digest, kind)
+		switch {
+		case desc.Annotations[ocispec.AnnotationRefName] == "example.com/repo:taga",
+			desc.Annotations[ocispec.AnnotationRefName] == "example.com/repo:tagb":
+			// Real image/index entries: kind must be gone entirely.
+			if hasKind {
+				t.Errorf("descriptor %s (real image/index): expected no kind annotation, got %q", desc.Digest, kind)
+			}
+		default:
+			// Orphaned sig/att/sbom (no matching base image in this fixture):
+			// retained under the old compound key, kind normalized but present.
+			if !hasKind {
+				t.Errorf("descriptor %s (orphaned artifact): expected a retained kind annotation, got none", desc.Digest)
+			} else if !strings.HasPrefix(kind, newPrefix) {
+				t.Errorf("descriptor %s: Walk returned unexpected kind %q... want dev.hauler/... prefix",
+					desc.Digest, kind)
+			}
 		}
+	}
+}
+
+// TestLoadIndex_MigratesLegacySigAttSbomToTrueRefs verifies the migration of
+// a legacy-format index.json where a base image and its
+// sig/att/sbom all shared the base image's ref.name (only "kind" told them
+// apart, and even then only sig/att/sbom, not from each other's ref)
+// migrates on load so each artifact gets its own unique, derived true ref
+// (repo:sha256-<parentDigestHex>.sig/.att/.sbom), with no lingering kind
+// annotation and no ref.name collisions.
+func TestLoadIndex_MigratesLegacySigAttSbomToTrueRefs(t *testing.T) {
+	dir := t.TempDir()
+
+	const baseRef = "example.com/repo:v1"
+	imageDigest := fakeDigest("11")
+	imageDesc := ocispec.Descriptor{
+		MediaType: ocispec.MediaTypeImageManifest,
+		Digest:    imageDigest,
+		Size:      100,
+		Annotations: map[string]string{
+			ocispec.AnnotationRefName: baseRef,
+			consts.KindAnnotationName: consts.KindAnnotationImage,
+		},
+	}
+
+	related := []struct {
+		kind string
+		ext  string
+	}{
+		{consts.KindAnnotationSigs, ".sig"},
+		{consts.KindAnnotationAtts, ".att"},
+		{consts.KindAnnotationSboms, ".sbom"},
+	}
+	manifests := []ocispec.Descriptor{imageDesc}
+	for i, r := range related {
+		manifests = append(manifests, ocispec.Descriptor{
+			MediaType: ocispec.MediaTypeImageManifest,
+			Digest:    fakeDigest(strings.Repeat(string(rune('a'+i)), 1)),
+			Size:      50,
+			Annotations: map[string]string{
+				// Every legacy artifact shares the BASE IMAGE's ref -- the collision the migration fixes.
+				ocispec.AnnotationRefName:     baseRef,
+				consts.KindAnnotationName:     r.kind,
+				consts.ContainerdImageNameKey: baseRef,
+			},
+		})
+	}
+
+	buildMinimalOCILayout(t, dir, manifests)
+
+	o, err := NewOCI(dir)
+	if err != nil {
+		t.Fatalf("NewOCI: %v", err)
+	}
+
+	wantRefs := map[string]bool{
+		baseRef: false, // real image, ref unchanged
+	}
+	digestTag := strings.ReplaceAll(imageDigest.String(), ":", "-")
+	for _, r := range related {
+		wantRefs["example.com/repo:"+digestTag+r.ext] = false
+	}
+
+	seen := map[string]ocispec.Descriptor{}
+	if err := o.Walk(func(_ string, desc ocispec.Descriptor) error {
+		seen[desc.Annotations[ocispec.AnnotationRefName]] = desc
+		return nil
+	}); err != nil {
+		t.Fatalf("Walk: %v", err)
+	}
+
+	if len(seen) != len(wantRefs) {
+		t.Fatalf("Walk returned %d distinct refs, want %d (no ref.name collisions): %v", len(seen), len(wantRefs), seen)
+	}
+	for ref := range wantRefs {
+		desc, ok := seen[ref]
+		if !ok {
+			t.Errorf("expected migrated ref %q not found after Walk", ref)
+			continue
+		}
+		if _, hasKind := desc.Annotations[consts.KindAnnotationName]; hasKind {
+			t.Errorf("descriptor with ref %q: expected no kind annotation after migration, got %q",
+				ref, desc.Annotations[consts.KindAnnotationName])
+		}
+	}
+}
+
+// TestLoadIndex_OrphanedArtifactRetainsOldCompoundKey verifies the data-loss
+// guard: when a legacy sig/att/sbom/referrer's base image is absent from the
+// store (removed independently, or never present in this fixture), its true
+// ref can't be derived -- loadIndexLocked must retain the entry under its old
+// "ref-kind" compound key rather than silently drop it.
+func TestLoadIndex_OrphanedArtifactRetainsOldCompoundKey(t *testing.T) {
+	dir := t.TempDir()
+
+	const baseRef = "example.com/orphan:v1"
+	manifests := []ocispec.Descriptor{
+		{
+			MediaType: ocispec.MediaTypeImageManifest,
+			Digest:    fakeDigest("orphansig"),
+			Size:      50,
+			Annotations: map[string]string{
+				ocispec.AnnotationRefName:     baseRef,
+				consts.KindAnnotationName:     consts.KindAnnotationSigs,
+				consts.ContainerdImageNameKey: baseRef,
+			},
+		},
+	}
+	buildMinimalOCILayout(t, dir, manifests)
+
+	o, err := NewOCI(dir)
+	if err != nil {
+		t.Fatalf("NewOCI: %v", err)
+	}
+
+	var found bool
+	wantKey := fmt.Sprintf("%s-%s", baseRef, consts.KindAnnotationSigs)
+	if err := o.Walk(func(key string, desc ocispec.Descriptor) error {
+		if key == wantKey {
+			found = true
+			if desc.Annotations[ocispec.AnnotationRefName] != baseRef {
+				t.Errorf("orphaned entry ref.name = %q, want unchanged %q", desc.Annotations[ocispec.AnnotationRefName], baseRef)
+			}
+			if desc.Annotations[consts.KindAnnotationName] != consts.KindAnnotationSigs {
+				t.Errorf("orphaned entry kind = %q, want retained %q", desc.Annotations[consts.KindAnnotationName], consts.KindAnnotationSigs)
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("Walk: %v", err)
+	}
+	if !found {
+		t.Fatalf("orphaned entry not retained under old compound key %q", wantKey)
 	}
 }
 

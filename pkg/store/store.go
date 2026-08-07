@@ -199,7 +199,6 @@ func (l *Layout) AddArtifact(ctx context.Context, oci artifacts.OCI, ref string)
 		Digest:    digest.FromBytes(mdata),
 		Size:      int64(len(mdata)),
 		Annotations: map[string]string{
-			consts.KindAnnotationName: consts.KindAnnotationImage,
 			ocispec.AnnotationRefName: ref,
 		},
 		URLs:     nil,
@@ -287,7 +286,7 @@ func (l *Layout) AddImage(ctx context.Context, ref string, platform string, excl
 		if err != nil {
 			return "", fmt.Errorf("getting index digest for %q: %w", ref, err)
 		}
-		if err := l.writeIndex(ctx, parsedRef, idx, consts.KindAnnotationIndex); err != nil {
+		if err := l.writeIndex(ctx, parsedRef, idx); err != nil {
 			return "", err
 		}
 	} else {
@@ -312,7 +311,7 @@ func (l *Layout) AddImage(ctx context.Context, ref string, platform string, excl
 		if err != nil {
 			return "", fmt.Errorf("getting image digest for %q: %w", ref, err)
 		}
-		if err := l.writeImage(ctx, parsedRef, img, consts.KindAnnotationImage, ""); err != nil {
+		if err := l.writeImage(ctx, parsedRef, img, ""); err != nil {
 			return "", err
 		}
 	}
@@ -349,7 +348,7 @@ func (l *Layout) AddLocalImage(ctx context.Context, ref string) (string, error) 
 		return "", fmt.Errorf("getting image digest for %q: %w", ref, err)
 	}
 
-	if err := l.writeImage(ctx, parsedRef, img, consts.KindAnnotationImage, ""); err != nil {
+	if err := l.writeImage(ctx, parsedRef, img, ""); err != nil {
 		return "", err
 	}
 	return d.String(), nil
@@ -428,10 +427,14 @@ func (l *Layout) writeImageBlobs(ctx context.Context, img v1.Image) error {
 	return l.writeBlobData(ctx, manifestData)
 }
 
-// writeImage writes all blobs for img and adds a descriptor entry to the OCI index with the
-// given annotationRef and kind. containerdName overrides the io.containerd.image.name annotation;
-// if empty it defaults to annotationRef.Name().
-func (l *Layout) writeImage(ctx context.Context, annotationRef gname.Reference, img v1.Image, kind string, containerdName string) error {
+// writeImage writes all blobs for img and adds a descriptor entry to the OCI index under
+// annotationRef -- every caller's own true reference, never a shared/borrowed one, since that
+// uniqueness is what content.OCI's nameMap keys on. containerdName overrides the
+// io.containerd.image.name annotation; if empty it defaults to annotationRef.Name(). Callers
+// writing a sig/att/sbom/referrer pass their own artifact ref as annotationRef and the base
+// image's ref.Name() as containerdName, making containerdName a subject pointer back to the
+// image this artifact is about (see consts.ContainerdImageNameKey's doc comment).
+func (l *Layout) writeImage(ctx context.Context, annotationRef gname.Reference, img v1.Image, containerdName string) error {
 	if err := l.writeImageBlobs(ctx, img); err != nil {
 		return err
 	}
@@ -461,7 +464,6 @@ func (l *Layout) writeImage(ctx context.Context, annotationRef gname.Reference, 
 		Digest:    d,
 		Size:      int64(len(raw)),
 		Annotations: map[string]string{
-			consts.KindAnnotationName:     kind,
 			ocispec.AnnotationRefName:     strings.TrimPrefix(annotationRef.Name(), annotationRef.Context().RegistryStr()+"/"),
 			consts.ContainerdImageNameKey: containerdName,
 		},
@@ -504,8 +506,10 @@ func (l *Layout) writeIndexBlobs(ctx context.Context, idx v1.ImageIndex) error {
 }
 
 // writeIndex writes all blobs for an image index (including all child platform images) and adds
-// a descriptor entry to the OCI index with the given annotationRef and kind.
-func (l *Layout) writeIndex(ctx context.Context, annotationRef gname.Reference, idx v1.ImageIndex, kind string) error {
+// a descriptor entry to the OCI index under annotationRef. Unlike writeImage, an index is never
+// itself a sig/att/sbom/referrer subject pointer, so there is no containerdName override --
+// io.containerd.image.name is always the index's own name.
+func (l *Layout) writeIndex(ctx context.Context, annotationRef gname.Reference, idx v1.ImageIndex) error {
 	if err := l.writeIndexBlobs(ctx, idx); err != nil {
 		return err
 	}
@@ -536,7 +540,6 @@ func (l *Layout) writeIndex(ctx context.Context, annotationRef gname.Reference, 
 		Digest:    d,
 		Size:      int64(len(raw)),
 		Annotations: map[string]string{
-			consts.KindAnnotationName:     kind,
 			ocispec.AnnotationRefName:     strings.TrimPrefix(annotationRef.Name(), annotationRef.Context().RegistryStr()+"/"),
 			consts.ContainerdImageNameKey: annotationRef.Name(),
 		},
@@ -591,10 +594,11 @@ func (l *Layout) saveReferrers(ctx context.Context, ref gname.Reference, hash v1
 			continue
 		}
 
-		// Embed the referrer manifest digest in the kind annotation so that multiple
-		// referrers for the same base image each get a unique entry in the OCI index.
-		kind := consts.KindAnnotationReferrers + "/" + referrerDesc.Digest.Hex
-		if err := l.writeImage(ctx, ref, img, kind, ""); err != nil {
+		// digestRef (repo@referrerDigest) is the referrer's own true ref -- unique on
+		// its own, since it embeds the referrer manifest's digest, rather than the base
+		// image's ref that every referrer would otherwise share. ref.Name() (the base
+		// image, with registry) becomes the subject pointer.
+		if err := l.writeImage(ctx, digestRef, img, ref.Name()); err != nil {
 			return fmt.Errorf("saving OCI referrer %s for %s: %w", referrerDesc.Digest, ref.Name(), err)
 		}
 		log.Debug().Msgf("saved OCI referrer %s (%s) for %s", referrerDesc.Digest, string(referrerDesc.ArtifactType), ref.Name())
@@ -611,17 +615,10 @@ func (l *Layout) saveRelatedArtifacts(ctx context.Context, ref gname.Reference, 
 	// Cosign tag convention: "sha256:hexvalue" → "sha256-hexvalue.sig" / ".att" / ".sbom"
 	tagPrefix := strings.ReplaceAll(hash.String(), ":", "-")
 
-	related := []struct {
-		tag  string
-		kind string
-	}{
-		{tagPrefix + ".sig", consts.KindAnnotationSigs},
-		{tagPrefix + ".att", consts.KindAnnotationAtts},
-		{tagPrefix + ".sbom", consts.KindAnnotationSboms},
-	}
+	related := []string{tagPrefix + ".sig", tagPrefix + ".att", tagPrefix + ".sbom"}
 
-	for _, r := range related {
-		artifactRef, err := gname.ParseReference(ref.Context().String() + ":" + r.tag)
+	for _, tag := range related {
+		artifactRef, err := gname.ParseReference(ref.Context().String() + ":" + tag)
 		if err != nil {
 			continue
 		}
@@ -630,8 +627,12 @@ func (l *Layout) saveRelatedArtifacts(ctx context.Context, ref gname.Reference, 
 			// Artifact doesn't exist at this registry; skip silently.
 			continue
 		}
-		if err := l.writeImage(ctx, ref, img, r.kind, ""); err != nil {
-			return saved, fmt.Errorf("saving %s for %s: %w", r.kind, ref.Name(), err)
+		// artifactRef (repo:sha256-<hex>.sig/.att/.sbom) is this artifact's own true
+		// ref -- unique on its own, rather than the base image ref that every
+		// sig/att/sbom would otherwise share. ref.Name() (the base image, with
+		// registry) becomes the subject pointer.
+		if err := l.writeImage(ctx, artifactRef, img, ref.Name()); err != nil {
+			return saved, fmt.Errorf("saving %s for %s: %w", tag, ref.Name(), err)
 		}
 		if d, err := img.Digest(); err == nil {
 			saved[d.String()] = true
@@ -865,9 +866,10 @@ func (l *Layout) pushData(ctx context.Context, desc ocispec.Descriptor, data []b
 func (l *Layout) CopyAll(ctx context.Context, to content.Target, toMapper func(string) (string, error)) ([]ocispec.Descriptor, error) {
 	var descs []ocispec.Descriptor
 	err := l.OCI.Walk(func(reference string, desc ocispec.Descriptor) error {
-		// Use the clean reference from annotations (without -kind suffix) as the base
-		// The reference parameter from Walk is the nameMap key with format "ref-kind",
-		// but we need the clean ref for the destination to avoid double-appending kind
+		// The reference parameter from Walk is the nameMap key, which for legacy
+		// orphaned sig/att/sbom entries retained via oci.go's migration fallback is
+		// still the old "ref-kind" compound form -- use the annotation's own true
+		// ref instead so callers never see that fallback shape.
 		baseRef := desc.Annotations[ocispec.AnnotationRefName]
 		if baseRef == "" {
 			return fmt.Errorf("descriptor %s missing required annotation %q", reference, ocispec.AnnotationRefName)
