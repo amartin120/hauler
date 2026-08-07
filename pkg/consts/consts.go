@@ -40,9 +40,6 @@ const (
 	// artifactType constants, since oras-go is only an indirect dependency.
 	FileArtifactType = "application/vnd.unknown.artifact.v1"
 
-	// memory media types
-	MemoryConfigMediaType = "application/vnd.content.hauler.memory.config.v1+json"
-
 	// wasm media types
 	WasmArtifactLayerMediaType = "application/vnd.wasm.content.layer.v1+wasm"
 	WasmConfigMediaType        = "application/vnd.wasm.config.v1+json"

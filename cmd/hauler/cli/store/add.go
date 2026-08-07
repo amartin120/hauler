@@ -1018,7 +1018,7 @@ func chartJobKey(j chartJob) string {
 // Only the chart traversal runs inside log.CaptureOutput. Helm's downloader can
 // still print to stdout from a transitive dependency, and debug=true routes
 // that to DEBUG -- silent at the default level, which is what the per-call
-// os.Stdout swap deleted from pkg/content/chart achieved. The image phase is
+// os.Stdout swap deleted from pkg/artifacts/chart achieved. The image phase is
 // outside it because the capture is scoped to what Helm prints; hauler's own
 // log lines never reach it either way, since log.NewLogger binds its writer at
 // construction (pkg/log/log.go).

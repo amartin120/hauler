@@ -208,24 +208,6 @@ func (l *Layout) AddArtifact(ctx context.Context, oci artifacts.OCI, ref string)
 	return idx, l.OCI.AddIndex(idx)
 }
 
-// AddArtifactCollection .
-func (l *Layout) AddArtifactCollection(ctx context.Context, collection artifacts.OCICollection) ([]ocispec.Descriptor, error) {
-	cnts, err := collection.Contents()
-	if err != nil {
-		return nil, err
-	}
-
-	var descs []ocispec.Descriptor
-	for ref, oci := range cnts {
-		desc, err := l.AddArtifact(ctx, oci, ref)
-		if err != nil {
-			return nil, err
-		}
-		descs = append(descs, desc)
-	}
-	return descs, nil
-}
-
 // AddImage fetches a container image (or full index for multi-arch images) from a remote registry
 // and saves it to the store along with any associated signatures, attestations, and SBOMs
 // discovered via cosign's tag convention (<digest>.sig, <digest>.att, <digest>.sbom).
