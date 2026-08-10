@@ -78,7 +78,7 @@ func TestHttp_MediaType_StripsContentTypeParams(t *testing.T) {
 		t.Fatalf("url.Parse: %v", err)
 	}
 
-	h := getter.NewHttp()
+	h := getter.NewHttp(false, "")
 	if got, want := h.MediaType(u), "text/plain"; got != want {
 		t.Errorf("MediaType() = %q, want %q", got, want)
 	}
@@ -100,7 +100,7 @@ func TestHttp_MediaType_FallbackNoContentTypeHeader(t *testing.T) {
 		t.Fatalf("url.Parse: %v", err)
 	}
 
-	h := getter.NewHttp()
+	h := getter.NewHttp(false, "")
 	if got, want := h.MediaType(u), "application/octet-stream"; got != want {
 		t.Errorf("MediaType() = %q, want %q", got, want)
 	}
@@ -115,7 +115,7 @@ func TestHttp_MediaType_FallbackHeadFails(t *testing.T) {
 		t.Fatalf("url.Parse: %v", err)
 	}
 
-	h := getter.NewHttp()
+	h := getter.NewHttp(false, "")
 	if got, want := h.MediaType(u), "application/octet-stream"; got != want {
 		t.Errorf("MediaType() = %q, want %q", got, want)
 	}
@@ -137,7 +137,7 @@ func TestHttp_Annotations_UsesLastModified(t *testing.T) {
 		t.Fatalf("url.Parse: %v", err)
 	}
 
-	ann := getter.NewHttp().Annotations(u)
+	ann := getter.NewHttp(false, "").Annotations(u)
 
 	if got, want := ann[ocispec.AnnotationURL], u.String(); got != want {
 		t.Errorf("annotations[%s] = %q, want %q", ocispec.AnnotationURL, got, want)
@@ -160,7 +160,7 @@ func TestHttp_Annotations_OmitsCreatedWithoutLastModified(t *testing.T) {
 		t.Fatalf("url.Parse: %v", err)
 	}
 
-	ann := getter.NewHttp().Annotations(u)
+	ann := getter.NewHttp(false, "").Annotations(u)
 
 	if got, want := ann[ocispec.AnnotationURL], u.String(); got != want {
 		t.Errorf("annotations[%s] = %q, want %q", ocispec.AnnotationURL, got, want)
@@ -198,7 +198,7 @@ func TestHttp_Annotations_Deterministic(t *testing.T) {
 				t.Fatalf("url.Parse: %v", err)
 			}
 
-			h := getter.NewHttp()
+			h := getter.NewHttp(false, "")
 			first := h.Annotations(u)
 			time.Sleep(1100 * time.Millisecond) // long enough for a clock-derived RFC3339 value to tick
 			second := h.Annotations(u)

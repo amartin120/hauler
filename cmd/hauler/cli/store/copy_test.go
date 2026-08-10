@@ -257,7 +257,7 @@ func TestCopyCmd_Registry_AllArtifactKindsLandAtSameDestRefs(t *testing.T) {
 	seedOCI11Referrer(t, srcHost, "test/allkinds", srcImg)
 
 	s := newTestStore(t)
-	if _, err := s.AddImage(ctx, srcHost+"/test/allkinds:v1", "", false, ""); err != nil {
+	if _, err := s.AddImage(ctx, srcHost+"/test/allkinds:v1", "", false, "", false, ""); err != nil {
 		t.Fatalf("AddImage: %v", err)
 	}
 

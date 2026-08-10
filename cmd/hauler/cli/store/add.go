@@ -1180,7 +1180,8 @@ func fetchChart(ctx context.Context, s *store.Layout, j chartJob, tempRoot strin
 		} else {
 			addErr := retry.Operation(ctx, rso, ro, func() error {
 				var digErr error
-				chartDigest, digErr = s.AddImage(ctx, ociRefStr, "", false, "")
+				chartDigest, digErr = s.AddImage(ctx, ociRefStr, "", false, "",
+					j.opts.ChartOpts.InsecureSkipTLSVerify, j.opts.ChartOpts.CaFile)
 				return digErr
 			})
 			switch {
